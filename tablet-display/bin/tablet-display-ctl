@@ -499,7 +499,18 @@ apply_display() { # output method
         niri msg output "$out" mode "${w}x${h}@$(printf '%.3f' "$r")" >>"$LOG" 2>&1 || log "niri: mode ${w}x${h}@$r failed"
       fi
       niri msg output "$out" scale "$scale" >>"$LOG" 2>&1
+      # niri re-places every output without an explicit position to the right
+      # of the positioned ones, so placing the tablet pushes the laptop screen
+      # away. Pin the other monitors where they were before Extend first.
+      local home n px py
+      home=$(session | jq -c '.home // {}')
+      MONS_OVERRIDE=$(monitors_json | jq -c --argjson h "$home" \
+        'map(if $h[.name] then .x = $h[.name].x | .y = $h[.name].y else . end)')
+      while read -r n px py; do
+        niri msg output "$n" position set -- "$px" "$py" >>"$LOG" 2>&1
+      done < <(monitors_json | jq -r --arg o "$out" '.[] | select(.enabled and .name != $o) | "\(.name) \(.x) \(.y)"')
       read -r x y < <(placement "$lw" "$lh" "$out")
+      MONS_OVERRIDE=""
       niri msg output "$out" position set -- "$x" "$y" >>"$LOG" 2>&1
       ;;
     *)
