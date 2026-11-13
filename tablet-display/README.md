@@ -51,12 +51,39 @@ that passes its checksums, only touches external connectors, only turns on one
 that is disconnected, and only turns off one it turned on.
 `sudo helper/install.sh --remove` removes it.
 
+## Set up Sunshine (once)
+
+1. **Install Sunshine** (see [Requirements](#requirements)).
+2. **Start it once**, so you can reach its settings page:
+   ```
+   systemctl --user start app-dev.lizardbyte.app.Sunshine
+   ```
+   The unit name depends on how Sunshine was packaged; `systemctl --user list-unit-files | grep -i sunshine`
+   shows yours. Turning on **Extend** in the panel also starts it.
+3. **Create Sunshine's login.** Open <https://localhost:47990>, or press
+   **Sunshine** in the panel. Your browser will warn about the certificate:
+   Sunshine uses a self-signed one, so continue to the page. The first visit
+   asks you to choose a username and password; you need them to pair Moonlight.
+4. **Leave capture settings to the plugin.** While the tablet display is on,
+   the plugin sets Sunshine's output, capture method, audio and session hooks
+   itself, in a marked block of `~/.config/sunshine/sunshine.conf`. Other
+   settings, such as encoder and bitrate, are yours to change in the web UI.
+5. **Don't enable Sunshine at login.** The plugin starts Sunshine when you turn
+   the display on and stops it when you turn it off, so nothing can be
+   streamed while it's off (see *Keep Sunshine running when off* in the
+   advanced settings).
+6. **If touch or the keyboard doesn't work later,** log out and back in once.
+   Sunshine's package installs a udev rule that gives your session access to
+   `/dev/uinput`, and it applies at the next login.
+
 ## Use it
 
 1. Pick your tablet under **Settings → Plugins → Tablet Display** (or leave
    *Auto*).
 2. Open the panel from the bar widget and choose **Extend** or **Mirror**.
-3. The first time, open **Pair** and enter the PIN Moonlight shows.
+3. **Pair, the first time:** in Moonlight on the tablet, add this computer by
+   the address the panel shows. Moonlight displays a PIN. Press **Pair** in the
+   panel, sign in with Sunshine's username and password, and enter the PIN.
 4. In Moonlight, set the resolution to **Native** and start **Desktop**.
 
 Right-clicking the bar widget, or the control-center tile, turns Extend on and
