@@ -215,15 +215,16 @@ $CTL uninstall      # turn off, restore sunshine.conf, delete state
   as your laptop screen.
 - **120 Hz at full resolution** needs a lot of bandwidth. If the frame rate
   wanders, stream at 90 fps or pick a lower resolution in Moonlight.
-- **Touch and placement.** Sunshine refuses to create its touch and pointer
-  device for a display at a negative position, so for **Left** and **Above**
-  the plugin moves your other monitors right or down instead of placing the
-  tablet at negative coordinates (niri, sway, mango). Sunshine sets up the
-  device when Moonlight connects: after turning on the display or changing
-  **Placement**, restart the stream in Moonlight if touch doesn't respond.
-  Moonlight's trackpad mode keeps working across placement changes. On Hyprland, **Left** and **Above** still use
-  `auto-left`/`auto-up`; if touch doesn't work there, use **Right** or
-  **Below**.
+- **Touch and placement.** Sunshine maps touch onto a desktop it assumes
+  starts at 0,0, and refuses a display at a negative position. So the plugin
+  always lays the monitors out from 0,0: for **Left** and **Above** it moves
+  your other monitors right or down instead of using negative coordinates, and
+  **Off** moves them back (niri, sway, mango). Sunshine works out where touch
+  goes when Moonlight connects, so after changing **Placement** during a stream,
+  reconnect Moonlight for direct touch to follow; the panel reminds you.
+  Moonlight's trackpad mode isn't affected. On Hyprland, **Left** and
+  **Above** still use `auto-left`/`auto-up`; if touch is off there, use
+  **Right** or **Below**.
 - **Touch on niri:** niri maps touch to a monitor only from its config. For
   Moonlight's direct-touch mode add `input { touch { map-to-output "DP-3" } }`
   (your display's name) to `config.kdl`. Moonlight's trackpad mode works

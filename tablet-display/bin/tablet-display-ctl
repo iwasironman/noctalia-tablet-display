@@ -476,18 +476,39 @@ placement() { # lw lh exclude
 # Final positions for every monitor, as "name x y" lines (the tablet last).
 # Others stay where they were (monitors_json, possibly overridden with their
 # remembered home positions); the tablet goes beside the reference. Then
-# everything is shifted so no coordinate is negative: Sunshine treats the
-# desktop as starting at 0,0 and refuses to create its touch/pointer device
-# for a display left of or above that ("mouse target viewport must be
-# contained by the virtual desktop").
+# everything is shifted so the layout starts exactly at 0,0. Sunshine treats
+# the desktop as starting at 0,0: it refuses to create its touch/pointer
+# device for a display left of or above that ("mouse target viewport must be
+# contained by the virtual desktop"), and with a gap before the first
+# monitor, absolute touch lands offset by the gap.
 layout_positions() { # out lw lh
   local x y
   read -r x y < <(placement "$2" "$3" "$1")
   monitors_json | jq -r --arg o "$1" --argjson x "$x" --argjson y "$y" '
     [(.[] | select(.enabled and .name != $o) | {name, x, y}), {name: $o, x: $x, y: $y}]
     | (map(.x) | min) as $mx | (map(.y) | min) as $my
-    | (if $mx < 0 then -$mx else 0 end) as $dx | (if $my < 0 then -$my else 0 end) as $dy
-    | .[] | "\(.name) \(.x + $dx) \(.y + $dy)"'
+    | .[] | "\(.name) \(.x - $mx) \(.y - $my)"'
+}
+
+# After the tablet is gone, move the remaining monitors back so the layout
+# starts at 0,0 again (Left/Above moved them right/down, and niri and
+# wlroots compositors keep positions set at runtime).
+rebase_layout() {
+  local lines=() n px py
+  case $COMP in niri|sway|mango|wlr) ;; *) return 0 ;; esac
+  mapfile -t lines < <(monitors_json | jq -r '
+    map(select(.enabled)) | (map(.x) | min // 0) as $mx | (map(.y) | min // 0) as $my
+    | select($mx != 0 or $my != 0) | .[] | "\(.name) \(.x - $mx) \(.y - $my)"')
+  ((${#lines[@]})) || return 0
+  for n in "${lines[@]}"; do
+    read -r n px py <<<"$n"
+    if [[ $COMP == niri ]]; then
+      niri msg output "$n" position set -- "$px" "$py" >>"$LOG" 2>&1
+    else
+      wlr-randr --output "$n" --pos="$px,$py" >>"$LOG" 2>&1
+    fi
+  done
+  log "rebased layout to 0,0"
 }
 
 apply_display() { # output method
@@ -789,7 +810,11 @@ teardown() { # [notice]
   # streaming another monitor, such as the laptop screen.
   [[ $mode != off ]] && stop_sunshine
   restore_conf || add_error "Could not restore $SUNSHINE_CONF"
-  [[ $mode == extend ]] && remove_display "$s"
+  if [[ $mode == extend ]]; then
+    remove_display "$s"
+    sleep 0.3
+    rebase_layout
+  fi
   # Off means nothing is streamed: leave Sunshine stopped, unless the user
   # asked to keep it running (as it was before we started).
   if [[ $mode != off && $was == true && $(setting keepSunshine) == true ]]; then
@@ -1006,6 +1031,10 @@ cmd_set() { # key value
   if [[ $mode == extend ]]; then
     ensure_env
     apply_display "$(jq -r .output <<<"$s")" "$(jq -r .method <<<"$s")"
+    # Sunshine works out where touch goes when Moonlight connects.
+    if [[ $(jq -r '.client != null' <<<"$s") == true ]]; then
+      set_notice "Reconnect Moonlight so touch follows the new placement (quit the stream and start it again)."
+    fi
   fi
   return 0
 }
