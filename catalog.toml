@@ -1,0 +1,12 @@
+[[plugin]]
+id           = "iwasironman/tablet-display"
+name         = "Tablet Display"
+version      = "0.1.0"
+author       = "iwasironman"
+license      = "MIT"
+icon         = "device-tablet"
+description  = "Use an Android tablet or iPad as an extended or mirrored display, streamed by Sunshine to Moonlight."
+deprecated   = false
+plugin_api   = 43
+tags         = ["display", "monitor", "tablet", "sunshine", "moonlight", "bar", "panel", "service"]
+dependencies = ["sunshine", "jq", "python3", "pkexec"]
