@@ -15,6 +15,15 @@ noctalia msg plugins source add tablet-display git https://github.com/iwasironma
 noctalia msg plugins enable iwasironman/tablet-display
 ```
 
+## Developing
+
+Add this checkout as a `path` source instead
+(`noctalia msg plugins source add tablet-dev path ~/src/noctalia-tablet-display`).
+`.luau` edits reload on their own, `plugin.toml` changes need
+`noctalia msg config-reload`, and changes to `translations/en.json` need the
+plugin disabled and enabled again (`noctalia msg plugins disable|enable
+iwasironman/tablet-display`); until then the panel shows raw keys.
+
 Ported from [omarchy-tablet-display](https://github.com/iwasironman/omarchy-tablet-display),
 the Hyprland/Omarchy version.
 
