@@ -473,6 +473,23 @@ placement() { # lw lh exclude
       else "\(.x + $rw) \(.y)" end' <<<"$ref"
 }
 
+# Final positions for every monitor, as "name x y" lines (the tablet last).
+# Others stay where they were (monitors_json, possibly overridden with their
+# remembered home positions); the tablet goes beside the reference. Then
+# everything is shifted so no coordinate is negative: Sunshine treats the
+# desktop as starting at 0,0 and refuses to create its touch/pointer device
+# for a display left of or above that ("mouse target viewport must be
+# contained by the virtual desktop").
+layout_positions() { # out lw lh
+  local x y
+  read -r x y < <(placement "$2" "$3" "$1")
+  monitors_json | jq -r --arg o "$1" --argjson x "$x" --argjson y "$y" '
+    [(.[] | select(.enabled and .name != $o) | {name, x, y}), {name: $o, x: $x, y: $y}]
+    | (map(.x) | min) as $mx | (map(.y) | min) as $my
+    | (if $mx < 0 then -$mx else 0 end) as $dx | (if $my < 0 then -$my else 0 end) as $dy
+    | .[] | "\(.name) \(.x + $dx) \(.y + $dy)"'
+}
+
 apply_display() { # output method
   local out=$1 method=$2 mode w h r scale lw lh x y
   mode=$(desired_mode "$out" "$method")
@@ -502,16 +519,19 @@ apply_display() { # output method
       # niri re-places every output without an explicit position to the right
       # of the positioned ones, so placing the tablet pushes the laptop screen
       # away. Pin the other monitors where they were before Extend first.
-      local home n px py
+      local home n px py lines=()
       home=$(session | jq -c '.home // {}')
       MONS_OVERRIDE=$(monitors_json | jq -c --argjson h "$home" \
         'map(if $h[.name] then .x = $h[.name].x | .y = $h[.name].y else . end)')
-      while read -r n px py; do
-        niri msg output "$n" position set -- "$px" "$py" >>"$LOG" 2>&1
-      done < <(monitors_json | jq -r --arg o "$out" '.[] | select(.enabled and .name != $o) | "\(.name) \(.x) \(.y)"')
-      read -r x y < <(placement "$lw" "$lh" "$out")
+      mapfile -t lines < <(layout_positions "$out" "$lw" "$lh")
       MONS_OVERRIDE=""
-      niri msg output "$out" position set -- "$x" "$y" >>"$LOG" 2>&1
+      # Park the tablet out of the way first, so no intermediate step
+      # overlaps (niri re-places overlapping outputs).
+      niri msg output "$out" position set -- 100000 0 >>"$LOG" 2>&1
+      for n in "${lines[@]}"; do
+        read -r n px py <<<"$n"
+        niri msg output "$n" position set -- "$px" "$py" >>"$LOG" 2>&1
+      done
       ;;
     *)
       # mango re-arranges every monitor when one changes mode, so the other
@@ -522,10 +542,13 @@ apply_display() { # output method
       home=$(session | jq -c '.home // {}')
       MONS_OVERRIDE=$(monitors_json | jq -c --argjson h "$home" \
         'map(if $h[.name] then .x = $h[.name].x | .y = $h[.name].y else . end)')
-      mapfile -t pins < <(monitors_json | jq -r --arg o "$out" \
-        '.[] | select(.enabled and .name != $o) | "--output", .name, "--pos=\(.x),\(.y)"')
-      read -r x y < <(placement "$lw" "$lh" "$out")
+      local all=() n px py
+      mapfile -t all < <(layout_positions "$out" "$lw" "$lh")
       MONS_OVERRIDE=""
+      for n in "${all[@]}"; do
+        read -r n px py <<<"$n"
+        if [[ $n == "$out" ]]; then x=$px; y=$py; else pins+=(--output "$n" "--pos=$px,$py"); fi
+      done
       local modearg=(--mode "${w}x${h}@${r}")
       [[ $method == virtual ]] && modearg=(--custom-mode "${w}x${h}@${r}Hz")
       # Mode and scale first, then positions: mango re-arranges monitors when
@@ -534,7 +557,7 @@ apply_display() { # output method
       # mango sometimes re-sorts monitors after a move (seen moving the tablet
       # from beside to above the screen); check, and send it again.
       local want got try
-      want=$(jq -cn --argjson h "$home" --arg o "$out" --argjson x "$x" --argjson y "$y" '$h + {($o): {x: $x, y: $y}}')
+      want=$(printf '%s\n' "${all[@]}" | jq -Rcn '[inputs | split(" ") | {(.[0]): {x: (.[1] | tonumber), y: (.[2] | tonumber)}}] | add')
       for try in 1 2 3; do
         wlr-randr "${pins[@]}" --output "$out" --pos="${x},${y}" >>"$LOG" 2>&1
         sleep 0.15
