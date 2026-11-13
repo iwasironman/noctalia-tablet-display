@@ -67,7 +67,8 @@ off.
   Moonlight's direct-touch mode add `input { touch { map-to-output "DP-3" } }`
   (your display's name) to `config.kdl`. Moonlight's trackpad mode works
   without it.
-- **mango** can only remove all virtual outputs at once.
+- **mango** can only remove all virtual outputs at once, and re-arranges
+  monitors when one changes; the plugin pins your other monitors in place.
 - The plugin edits `~/.config/sunshine/sunshine.conf` only inside a marked
   block, and comments out (then restores) your own lines for the same keys.
 

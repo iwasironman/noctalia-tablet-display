@@ -32,8 +32,10 @@ CTL=$(realpath "${BASH_SOURCE[0]}")
 BIN_DIR=$(dirname "$CTL")
 PLUGIN_DIR=$(dirname "$BIN_DIR")
 
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
-RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$APP"
+# The overrides exist for testing (test/nested-test.sh): a separate state,
+# and Sunshine started directly rather than through its systemd unit.
+STATE_DIR="${TABLET_DISPLAY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/$APP}"
+RUN_DIR="${TABLET_DISPLAY_RUN_DIR:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$APP}"
 SETTINGS="$STATE_DIR/settings.json"
 EDID="$STATE_DIR/edid.bin"
 EDID_ARGS="$STATE_DIR/edid.args"
@@ -102,39 +104,47 @@ with_lock() {
 
 # ---------------------------------------------------------------- compositor
 
+# Variables can outlive their session (systemd's user environment keeps what
+# the last session imported), so trust them only when their socket exists.
 detect_compositor() {
-  if [[ -n ${NIRI_SOCKET:-} ]]; then echo niri
-  elif [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then echo hyprland
-  elif [[ -n ${SWAYSOCK:-} ]]; then echo sway
-  elif [[ ${XDG_CURRENT_DESKTOP:-} == *mango* ]] || pgrep -x mango >/dev/null 2>&1; then echo mango
+  local rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  if [[ -n ${NIRI_SOCKET:-} && -S $NIRI_SOCKET ]]; then echo niri
+  elif [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} && -d $rt/hypr/$HYPRLAND_INSTANCE_SIGNATURE ]]; then echo hyprland
+  elif [[ -n ${SWAYSOCK:-} && -S $SWAYSOCK ]]; then echo sway
+  elif [[ -n ${MANGO_INSTANCE_SIGNATURE:-} && -S $MANGO_INSTANCE_SIGNATURE ]]; then echo mango
   elif command -v wlr-randr >/dev/null && wlr-randr >/dev/null 2>&1; then echo wlr
   else echo unknown
   fi
 }
 
-# Sunshine runs our hooks from its own environment. The systemd user
-# environment usually has the compositor's variables, but fall back to what
-# we saw when the session started.
+# While a display is on, every caller talks to the compositor that owns it:
+# Sunshine's hooks (systemd's environment), and the plugin's service in
+# another session on another VT, which shares this state. So the saved
+# compositor variables replace the caller's own, and empty ones are unset.
 COMP=""
 ensure_env() {
   local s k v
   s=$(session)
   while IFS=$'\t' read -r k v; do
-    [[ -n $k && -z ${!k:-} && -n $v ]] && export "$k=$v"
-  done < <(jq -r '.env | to_entries[] | "\(.key)\t\(.value)"' <<<"$s" 2>/dev/null)
+    [[ -n $k ]] || continue
+    if [[ -n $v ]]; then export "$k=$v"; else unset "$k"; fi
+  done < <(jq -r 'select(.mode != "off") | .env | to_entries[] | "\(.key)\t\(.value)"' <<<"$s" 2>/dev/null)
   if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} && -z ${NIRI_SOCKET:-} ]]; then
     local dir
     dir=$(ls -td "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/hypr/*/ 2>/dev/null | head -1)
     [[ -n $dir ]] && pgrep -x Hyprland >/dev/null 2>&1 && export HYPRLAND_INSTANCE_SIGNATURE=$(basename "$dir")
   fi
-  COMP=$(jq -r '.compositor // empty' <<<"$s")
+  # The saved compositor only matters while a display is on (hooks run from
+  # Sunshine's environment); otherwise detect, since the session may differ.
+  COMP=$(jq -r 'if .mode != "off" then (.compositor // empty) else empty end' <<<"$s")
   [[ -n $COMP ]] || COMP=$(detect_compositor)
 }
 
 env_snapshot() {
+  # mmsg needs MANGO_INSTANCE_SIGNATURE (the path of mango's socket).
   jq -cn --arg n "${NIRI_SOCKET:-}" --arg h "${HYPRLAND_INSTANCE_SIGNATURE:-}" \
-    --arg s "${SWAYSOCK:-}" --arg w "${WAYLAND_DISPLAY:-}" \
-    '{NIRI_SOCKET: $n, HYPRLAND_INSTANCE_SIGNATURE: $h, SWAYSOCK: $s, WAYLAND_DISPLAY: $w}'
+    --arg s "${SWAYSOCK:-}" --arg m "${MANGO_INSTANCE_SIGNATURE:-}" --arg w "${WAYLAND_DISPLAY:-}" \
+    '{NIRI_SOCKET: $n, HYPRLAND_INSTANCE_SIGNATURE: $h, SWAYSOCK: $s, MANGO_INSTANCE_SIGNATURE: $m, WAYLAND_DISPLAY: $w}'
 }
 
 niri_has_virtual() { niri msg create-virtual-output --help >/dev/null 2>&1; }
@@ -158,7 +168,9 @@ choose_method() {
 #     modes: [{w, h, r}]}]
 # x/y/lw/lh are logical (scaled) coordinates; pw/ph the pixel mode.
 
+MONS_OVERRIDE=""   # set by apply_display to place against remembered positions
 monitors_json() {
+  [[ -n $MONS_OVERRIDE ]] && { printf '%s' "$MONS_OVERRIDE"; return; }
   local out=""
   case $COMP in
     niri) out=$(niri_monitors) ;;
@@ -195,9 +207,15 @@ hypr_monitors() {
 }
 
 wlr_monitors() {
-  wlr-randr --json 2>/dev/null | jq -c '
+  # wlr-randr has no notion of focus; sway can tell us.
+  local f=""
+  case $COMP in
+    sway) f=$(swaymsg -t get_outputs 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null) ;;
+    mango) f=$(mmsg get all-monitors 2>/dev/null | jq -r '.monitors[]? | select(.active) | .name' 2>/dev/null | head -1) ;;
+  esac
+  wlr-randr --json 2>/dev/null | jq -c --arg f "$f" '
     [.[] | ((.modes // []) | map(select(.current)) | .[0]) as $m | (.scale // 1) as $s | {
-      name, enabled: (.enabled == true), focused: false,
+      name, enabled: (.enabled == true), focused: (.name == $f),
       x: (.position.x // 0), y: (.position.y // 0),
       lw: ((($m.width // 0) / $s) | round), lh: ((($m.height // 0) / $s) | round),
       pw: ($m.width // 0), ph: ($m.height // 0), refresh: ($m.refresh // 0), scale: $s,
@@ -212,7 +230,9 @@ monitor_names() { monitors_json | jq -r '.[].name'; }
 reference_monitor() { # [exclude]
   monitors_json | jq -c --arg x "${1:-}" '
     (map(select(.name != $x and .enabled))) as $m
-    | ($m | map(select(.focused)) | .[0]) // $m[0] // empty'
+    | ($m | map(select(.focused)) | .[0])
+      // ($m | map(select(.name | test("^(HEADLESS|TABLET)-") | not)) | .[0])
+      // $m[0] // empty'
 }
 
 monitor_signature() {
@@ -483,11 +503,34 @@ apply_display() { # output method
       niri msg output "$out" position set -- "$x" "$y" >>"$LOG" 2>&1
       ;;
     *)
+      # mango re-arranges every monitor when one changes mode, so the other
+      # monitors drift. Pin them at the positions they had when Extend
+      # started ("home"), place the tablet against those, and send it all in
+      # one request.
+      local home pins=()
+      home=$(session | jq -c '.home // {}')
+      MONS_OVERRIDE=$(monitors_json | jq -c --argjson h "$home" \
+        'map(if $h[.name] then .x = $h[.name].x | .y = $h[.name].y else . end)')
+      mapfile -t pins < <(monitors_json | jq -r --arg o "$out" \
+        '.[] | select(.enabled and .name != $o) | "--output", .name, "--pos=\(.x),\(.y)"')
+      read -r x y < <(placement "$lw" "$lh" "$out")
+      MONS_OVERRIDE=""
       local modearg=(--mode "${w}x${h}@${r}")
       [[ $method == virtual ]] && modearg=(--custom-mode "${w}x${h}@${r}Hz")
-      wlr-randr --output "$out" "${modearg[@]}" --scale "$scale" >>"$LOG" 2>&1
-      read -r x y < <(placement "$lw" "$lh" "$out")
-      wlr-randr --output "$out" --pos="${x},${y}" >>"$LOG" 2>&1
+      # Mode and scale first, then positions: mango re-arranges monitors when
+      # a mode change and a position arrive in the same request.
+      wlr-randr "${pins[@]}" --output "$out" "${modearg[@]}" --scale "$scale" >>"$LOG" 2>&1
+      # mango sometimes re-sorts monitors after a move (seen moving the tablet
+      # from beside to above the screen); check, and send it again.
+      local want got try
+      want=$(jq -cn --argjson h "$home" --arg o "$out" --argjson x "$x" --argjson y "$y" '$h + {($o): {x: $x, y: $y}}')
+      for try in 1 2 3; do
+        wlr-randr "${pins[@]}" --output "$out" --pos="${x},${y}" >>"$LOG" 2>&1
+        sleep 0.15
+        got=$(monitors_json | jq -c --argjson w "$want" 'map(select($w[.name])) | map({(.name): {x, y}}) | add // {}')
+        [[ $(jq -n --argjson a "$got" --argjson b "$want" '$a == $b') == true ]] && break
+        log "placement: try $try got $got"
+      done
       ;;
   esac
   sleep 0.2
@@ -537,6 +580,7 @@ sunshine_running() { pgrep -x sunshine >/dev/null 2>&1; }
 # "sunshine.service" only as an Alias= that exists once the unit is enabled.
 SUNSHINE_UNIT=""
 sunshine_has_unit() {
+  [[ ${TABLET_DISPLAY_SUNSHINE_UNIT:-} == none ]] && return 1
   [[ -n $SUNSHINE_UNIT ]] && return 0
   local u
   for u in app-dev.lizardbyte.app.Sunshine.service sunshine.service; do
@@ -555,6 +599,16 @@ stop_sunshine() {
 restart_sunshine() {
   stop_sunshine
   if sunshine_has_unit; then
+    # The unit gets systemd's user environment, which holds whatever session
+    # last imported into it. Point it at this one.
+    local v unset=()
+    for v in NIRI_SOCKET HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK MANGO_INSTANCE_SIGNATURE; do [[ -n ${!v:-} ]] || unset+=("$v"); done
+    ((${#unset[@]})) && systemctl --user unset-environment "${unset[@]}" 2>/dev/null
+    systemctl --user set-environment "WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}" \
+      ${NIRI_SOCKET:+"NIRI_SOCKET=$NIRI_SOCKET"} \
+      ${HYPRLAND_INSTANCE_SIGNATURE:+"HYPRLAND_INSTANCE_SIGNATURE=$HYPRLAND_INSTANCE_SIGNATURE"} \
+      ${SWAYSOCK:+"SWAYSOCK=$SWAYSOCK"} \
+      ${MANGO_INSTANCE_SIGNATURE:+"MANGO_INSTANCE_SIGNATURE=$MANGO_INSTANCE_SIGNATURE"} 2>/dev/null
     systemctl --user reset-failed "$SUNSHINE_UNIT" 2>/dev/null
     systemctl --user start "$SUNSHINE_UNIT" || return 1
   else
@@ -592,6 +646,9 @@ write_hook() {
   write_atomic "$HOOK" "$(cat <<HOOK_EOF
 #!/bin/sh
 # Written by $APP. Sunshine runs this when a Moonlight session starts or ends.
+$(for v in TABLET_DISPLAY_STATE_DIR TABLET_DISPLAY_RUN_DIR TABLET_DISPLAY_SUNSHINE_UNIT TABLET_DISPLAY_SUNSHINE_CONF; do
+    [ -n "${!v:-}" ] && printf "export %s='%s'\n" "$v" "${!v}"
+  done)
 ctl='$CTL'
 if [ -f "\$ctl" ]; then exec bash "\$ctl" "\$@"; fi
 conf='$SUNSHINE_CONF'
@@ -667,7 +724,9 @@ do_start() { # mode [target]
 
   if [[ $(session | jq -r .mode) != off ]]; then
     was=$(session | jq -r .sunshineWasRunning)
-    teardown
+    # Tear down with the compositor that owns the current display; a
+    # subshell so the new session below keeps the caller's own environment.
+    ( ensure_env; teardown )
   else
     sunshine_running && was=true || was=false
   fi
@@ -677,6 +736,9 @@ do_start() { # mode [target]
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
   if [[ $mode == extend ]]; then
+    # Where the real monitors are before the tablet appears; placement pins
+    # them here (see apply_display).
+    update_session '.home = $h' --argjson h "$(monitors_json | jq -c 'map(select(.enabled) | {(.name): {x, y}}) | add // {}')"
     method=$(choose_method)
     if [[ $method == virtual ]]; then
       local w h r
