@@ -11,6 +11,8 @@ encoding, up to 120 fps and low delay, without Miracast's 1080p limit.
 - The display matches your tablet's resolution, from a device preset or
   automatically from what Moonlight asks for.
 
+![The Tablet Display panel, extended and with Moonlight connected](screenshots/panel.webp)
+
 Tested with a Samsung Galaxy Tab S9 Ultra and a Framework Laptop 16 (Radeon
 780M) on niri 26.04, Hyprland 0.57, sway 1.12 and mango 0.18.5, with Sunshine
 2026.1109 and Noctalia 5.4.1. iPads, other tablets and other GPUs should work
