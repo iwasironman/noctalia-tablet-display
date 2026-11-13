@@ -9,6 +9,11 @@ M.PANEL_ID = "iwasironman/tablet-display:panel"
 
 local counter = 0
 
+function M.tr(key, subst)
+  return noctalia.tr(key, subst)
+end
+local tr = M.tr
+
 -- Asks the service to run an action. Each request carries a unique serial,
 -- because every entry is its own VM with its own counter.
 function M.send(action, extra)
@@ -41,34 +46,34 @@ end
 -- One line describing what is going on.
 function M.statusLine(s)
   if s.loading then
-    return "Loading…"
+    return tr("status.loading")
   end
   if s.available == false then
-    return "Control script failed"
+    return tr("status.script_failed")
   end
   local pending = s.pending or ""
-  if pending == "extend" then return "Adding the tablet display…" end
-  if pending == "mirror" then return "Starting to mirror…" end
-  if pending == "off" then return "Turning off…" end
+  if pending == "extend" then return tr("status.starting_extend") end
+  if pending == "mirror" then return tr("status.starting_mirror") end
+  if pending == "off" then return tr("status.stopping") end
   if s.mode == "extend" then
     local m = s.monitor
     if type(m) == "table" then
-      return `Extended on {m.name} · {m.width}×{m.height} @ {hz(m.refresh)} Hz`
+      return tr("status.extended_on", { output = m.name, width = m.width, height = m.height, hz = hz(m.refresh) })
     end
-    return "Extended"
+    return tr("status.extended")
   elseif s.mode == "mirror" then
-    return `Mirroring {s.target or "?"}`
+    return tr("status.mirroring", { output = s.target or "?" })
   end
-  return "Off"
+  return tr("status.off")
 end
 
 function M.clientLine(s)
   local c = s.client
   if type(c) == "table" and c.width then
-    return `Moonlight connected · {c.width}×{c.height} @ {c.fps} fps`
+    return tr("status.client_connected", { width = c.width, height = c.height, fps = c.fps })
   end
   if M.isActive(s) then
-    return "Waiting for Moonlight to connect"
+    return tr("status.client_waiting")
   end
   return ""
 end

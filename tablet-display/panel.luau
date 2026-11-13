@@ -2,24 +2,21 @@
 -- Tablet Display panel.
 
 local common = require("./lib/common.luau")
+local tr = common.tr
 
 local snapshot = common.snapshot()
 local isOpen = false
 
 local SCALES = { "auto", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "3" }
 local POSITIONS = {
-  { id = "left", glyph = "arrow-bar-left", label = "Left" },
-  { id = "above", glyph = "arrow-bar-up", label = "Above" },
-  { id = "below", glyph = "arrow-bar-down", label = "Below" },
-  { id = "right", glyph = "arrow-bar-right", label = "Right" },
+  { id = "left", glyph = "arrow-bar-left" },
+  { id = "above", glyph = "arrow-bar-up" },
+  { id = "below", glyph = "arrow-bar-down" },
+  { id = "right", glyph = "arrow-bar-right" },
 }
 
-local function card(children, opts)
-  local props = { gap = 8, padding = 12, fill = "surface_container/0.45", radius = 10, align = "stretch" }
-  if opts then
-    for k, v in pairs(opts) do props[k] = v end
-  end
-  return ui.column(props, children)
+local function card(children)
+  return ui.column({ gap = 8, padding = 12, fill = "surface_container/0.45", radius = 10, align = "stretch" }, children)
 end
 
 local function heading(text)
@@ -45,13 +42,13 @@ local function modeButtons()
   local mode = snapshot.mode or "off"
   local enabled = not busy() and snapshot.installed ~= false
   local helperMissing = snapshot.helper and snapshot.helper.needed and not snapshot.helper.installed
-  local function btn(id, text, glyph, extendBlocked)
+  local function btn(id, glyph, blocked)
     return ui.button({
-      text = text,
+      text = tr("panel.mode." .. id),
       glyph = glyph,
       variant = mode == id and "primary" or "outline",
       selected = mode == id,
-      enabled = enabled and not extendBlocked,
+      enabled = enabled and not blocked,
       flexGrow = 1,
       onClick = function()
         if id ~= mode then common.send(id) end
@@ -59,9 +56,9 @@ local function modeButtons()
     })
   end
   return ui.row({ gap = 6 }, {
-    btn("off", "Off", "power", false),
-    btn("extend", "Extend", "device-tablet", helperMissing),
-    btn("mirror", "Mirror", "copy", false),
+    btn("off", "power", false),
+    btn("extend", "device-tablet", helperMissing),
+    btn("mirror", "copy", false),
   })
 end
 
@@ -72,7 +69,7 @@ local function placementCard()
     table.insert(row, ui.button({
       key = "pos-" .. p.id,
       glyph = p.glyph,
-      tooltip = p.label,
+      tooltip = tr("panel.position." .. p.id),
       variant = pos == p.id and "primary" or "ghost",
       selected = pos == p.id,
       enabled = not busy(),
@@ -87,7 +84,7 @@ local function placementCard()
   local labels, selected = {}, 0
   for i, s in ipairs(SCALES) do
     if s == "auto" then
-      table.insert(labels, `Auto ({snapshot.scale or "?"}×)`)
+      table.insert(labels, tr("panel.scale_auto", { scale = snapshot.scale or "?" }))
     else
       table.insert(labels, s .. "×")
     end
@@ -95,10 +92,10 @@ local function placementCard()
   end
 
   return card({
-    heading("Placement"),
+    heading(tr("panel.placement")),
     ui.row({ gap = 4 }, row),
     ui.row({ gap = 8, align = "center" }, {
-      ui.label({ text = "Scale", color = "on_surface_variant", flexGrow = 1 }),
+      ui.label({ text = tr("panel.scale"), color = "on_surface_variant", flexGrow = 1 }),
       ui.select({
         options = labels,
         selectedIndex = selected,
@@ -116,52 +113,49 @@ end
 
 local function moonlightCard()
   local addrs = snapshot.addresses or {}
-  local where = snapshot.host or "this computer"
+  local where = snapshot.host or tr("panel.this_computer")
   if #addrs > 0 then
     where = `{where} ({table.concat(addrs, ", ")})`
   end
   local children = {
-    heading("Moonlight"),
-    muted("On the tablet, add " .. where .. " in Moonlight, then start Desktop. Set Moonlight's resolution to Native."),
+    heading(tr("panel.moonlight")),
+    muted(tr("panel.moonlight_help", { host = where })),
   }
   local client = common.clientLine(snapshot)
   if client ~= "" then
     table.insert(children, ui.label({ text = client, color = snapshot.client and "primary" or "on_surface_variant" }))
   end
   table.insert(children, ui.row({ gap = 6 }, {
-    ui.button({ text = "Pair", glyph = "key", variant = "outline", flexGrow = 1,
-      tooltip = "Open Sunshine's PIN page", onClick = function() common.send("pair") end }),
-    ui.button({ text = "Sunshine", glyph = "settings", variant = "outline", flexGrow = 1,
-      tooltip = "Open Sunshine's web settings", onClick = function() common.send("admin") end }),
+    ui.button({ text = tr("panel.pair"), glyph = "key", variant = "outline", flexGrow = 1,
+      tooltip = tr("panel.pair_tooltip"), onClick = function() common.send("pair") end }),
+    ui.button({ text = tr("panel.sunshine"), glyph = "settings", variant = "outline", flexGrow = 1,
+      tooltip = tr("panel.sunshine_tooltip"), onClick = function() common.send("admin") end }),
   }))
   return card(children)
 end
 
 local function setupMessages(children)
   if snapshot.available == false then
-    table.insert(children, message("The control script failed: " .. tostring((snapshot.errors or {})[1] or "unknown error"),
+    table.insert(children, message(tr("panel.script_failed", { error = tostring((snapshot.errors or {})[1] or "?") }),
       "error", "alert-triangle"))
     return
   end
   if snapshot.installed == false then
-    table.insert(children, card({
-      message("Sunshine isn't installed. Install it with your package manager (for example: sudo pacman -S sunshine), then open this panel again.",
-        "error", "alert-triangle"),
-    }))
+    table.insert(children, card({ message(tr("panel.sunshine_missing"), "error", "alert-triangle") }))
   end
   local h = snapshot.helper
   if type(h) == "table" and h.needed and (not h.installed or not h.current) then
-    local text = h.installed
-      and "The port helper is out of date. Update it to keep Extend working."
-      or (`Extend on {snapshot.compositor or "this compositor"} borrows an unused display port, which needs a small helper installed once with sudo.`)
+    local text = h.installed and tr("panel.helper_outdated")
+      or tr("panel.helper_needed", { compositor = snapshot.compositor or "?" })
     table.insert(children, card({
       message(text, "tertiary", "tool"),
-      ui.button({ text = h.installed and "Update helper" or "Install helper", glyph = "download", variant = "primary",
-        onClick = function() common.send("install-helper") end }),
+      ui.button({ text = h.installed and tr("panel.helper_update") or tr("panel.helper_install"), glyph = "download",
+        variant = "primary", onClick = function() common.send("install-helper") end }),
     }))
   end
 end
 
+-- Hints, notices and errors come from the control script in English.
 local function notices(children)
   local any = false
   if (snapshot.hint or "") ~= "" then
@@ -176,7 +170,7 @@ local function notices(children)
     table.insert(children, message(tostring(err), "error", "alert-triangle"))
   end
   if any and snapshot.available ~= false then
-    table.insert(children, ui.button({ text = "Dismiss", variant = "ghost", controlSize = "sm",
+    table.insert(children, ui.button({ text = tr("panel.dismiss"), variant = "ghost", controlSize = "sm",
       onClick = function() common.send("clear-errors") end }))
   end
 end
@@ -188,10 +182,10 @@ local function render()
     ui.row({ gap = 10, align = "center" }, {
       ui.glyph({ name = "device-tablet", size = 22, color = active and "primary" or "on_surface_variant" }),
       ui.column({ gap = 2, flexGrow = 1 }, {
-        ui.label({ text = "Tablet Display", fontWeight = "bold", fontSize = 15 }),
+        ui.label({ text = tr("title"), fontWeight = "bold", fontSize = 15 }),
         ui.label({ text = common.statusLine(snapshot), color = active and "primary" or "on_surface_variant", maxLines = 2 }),
       }),
-      ui.button({ glyph = "refresh", variant = "ghost", controlSize = "sm", tooltip = "Refresh",
+      ui.button({ glyph = "refresh", variant = "ghost", controlSize = "sm", tooltip = tr("panel.refresh"),
         onClick = function() common.send("refresh") end }),
     }),
   }
@@ -201,9 +195,9 @@ local function render()
   table.insert(children, placementCard())
   table.insert(children, moonlightCard())
   table.insert(children, ui.row({ gap = 6, justify = "end" }, {
-    ui.button({ text = "Diagnostics", glyph = "stethoscope", variant = "ghost", controlSize = "sm",
+    ui.button({ text = tr("panel.diagnostics"), glyph = "stethoscope", variant = "ghost", controlSize = "sm",
       onClick = function() common.send("doctor") end }),
-    ui.button({ text = "Settings", glyph = "adjustments", variant = "ghost", controlSize = "sm",
+    ui.button({ text = tr("panel.settings"), glyph = "adjustments", variant = "ghost", controlSize = "sm",
       onClick = function() noctalia.openSettings() end }),
   }))
   panel.render(ui.column({ gap = 12, padding = 4, align = "stretch" }, children))

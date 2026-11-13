@@ -2,13 +2,20 @@
 -- Control-center tile: Extend on/off.
 
 local common = require("./lib/common.luau")
+local tr = common.tr
 
 local snapshot = common.snapshot()
 
 local function render()
   local active = common.isActive(snapshot)
   local pending = (snapshot.pending or "") ~= ""
-  shortcut.setLabel(active and (snapshot.mode == "mirror" and "Mirroring" or "Tablet on") or "Tablet")
+  local label = tr("shortcut.off")
+  if snapshot.mode == "mirror" then
+    label = tr("shortcut.mirroring")
+  elseif active then
+    label = tr("shortcut.on")
+  end
+  shortcut.setLabel(label)
   shortcut.setIcon("device-tablet")
   shortcut.setActive(active)
   shortcut.setEnabled(not pending and snapshot.installed ~= false)

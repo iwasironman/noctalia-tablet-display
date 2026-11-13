@@ -17,6 +17,10 @@ local polling = false
 local lastConfig = ""
 local lastSerial = nil
 
+local function tr(key, subst)
+  return noctalia.tr(key, subst)
+end
+
 local function ctlPath()
   return noctalia.pluginDir() .. "/bin/tablet-display-ctl"
 end
@@ -106,14 +110,15 @@ local function runAction(command)
   end
 
   if action == "doctor" then
-    noctalia.runInTerminal("bash " .. shellQuote(ctlPath()) .. " doctor; echo; read -rp 'Press Enter to close ' _")
+    noctalia.runInTerminal("bash " .. shellQuote(ctlPath()) .. " doctor; echo; read -rp "
+      .. shellQuote(tr("service.press_enter") .. " ") .. " _")
     return
   end
 
   if action == "install-helper" then
     local script = noctalia.pluginDir() .. "/helper/install.sh"
-    noctalia.runInTerminal("echo 'Installing the Tablet Display port helper (needs sudo).'; sudo bash "
-      .. shellQuote(script) .. "; echo; read -rp 'Press Enter to close ' _")
+    noctalia.runInTerminal("echo " .. shellQuote(tr("service.installing_helper")) .. "; sudo bash "
+      .. shellQuote(script) .. "; echo; read -rp " .. shellQuote(tr("service.press_enter") .. " ") .. " _")
     return
   end
 
@@ -127,7 +132,7 @@ local function runAction(command)
     return
   end
   if actionInFlight ~= "" then
-    noctalia.notify("Tablet Display", "Still busy: " .. actionInFlight)
+    noctalia.notify(tr("title"), tr("service.busy", { action = actionInFlight }))
     return
   end
 
@@ -143,11 +148,11 @@ local function runAction(command)
   run(args, function(result)
     actionInFlight = ""
     if not result or result.timedOut then
-      noctalia.notifyError("Tablet Display", "'" .. action .. "' timed out")
+      noctalia.notifyError(tr("title"), tr("service.timed_out", { action = action }))
     elseif result.exitCode ~= 0 and result.exitCode ~= 75 then
       local msg = noctalia.string.trim(result.stderr or "")
       if msg ~= "" then
-        noctalia.notifyError("Tablet Display", msg)
+        noctalia.notifyError(tr("title"), msg)
       end
     end
     poll()

@@ -1,4 +1,5 @@
 {
+  "title": "Tablet Display",
   "settings": {
     "device": {
       "label": "Tablet",
@@ -42,5 +43,67 @@
       "label": "Keep Sunshine running when off",
       "description": "Off normally stops Sunshine so nothing can be streamed. Turn this on to leave Sunshine running as it was before, with your own Sunshine settings (which may stream your main screen)."
     }
+  },
+  "status": {
+    "loading": "Loading…",
+    "script_failed": "Control script failed",
+    "starting_extend": "Adding the tablet display…",
+    "starting_mirror": "Starting to mirror…",
+    "stopping": "Turning off…",
+    "extended_on": "Extended on {output} · {width}×{height} @ {hz} Hz",
+    "extended": "Extended",
+    "mirroring": "Mirroring {output}",
+    "off": "Off",
+    "client_connected": "Moonlight connected · {width}×{height} @ {fps} fps",
+    "client_waiting": "Waiting for Moonlight to connect"
+  },
+  "panel": {
+    "mode": {
+      "off": "Off",
+      "extend": "Extend",
+      "mirror": "Mirror"
+    },
+    "position": {
+      "left": "Left",
+      "above": "Above",
+      "below": "Below",
+      "right": "Right"
+    },
+    "placement": "Placement",
+    "scale": "Scale",
+    "scale_auto": "Auto ({scale}×)",
+    "moonlight": "Moonlight",
+    "this_computer": "this computer",
+    "moonlight_help": "On the tablet, add {host} in Moonlight, then start Desktop. Set Moonlight's resolution to Native.",
+    "pair": "Pair",
+    "pair_tooltip": "Open Sunshine's PIN page",
+    "sunshine": "Sunshine",
+    "sunshine_tooltip": "Open Sunshine's web settings",
+    "script_failed": "The control script failed: {error}",
+    "sunshine_missing": "Sunshine isn't installed. Install it with your package manager (for example: sudo pacman -S sunshine), then open this panel again.",
+    "helper_outdated": "The port helper is out of date. Update it to keep Extend working.",
+    "helper_needed": "Extend on {compositor} borrows an unused display port, which needs a small helper installed once with sudo.",
+    "helper_update": "Update helper",
+    "helper_install": "Install helper",
+    "dismiss": "Dismiss",
+    "refresh": "Refresh",
+    "diagnostics": "Diagnostics",
+    "settings": "Settings"
+  },
+  "widget": {
+    "problem": "Problem",
+    "see_panel": "see the panel",
+    "hint": "Click: panel · Right-click: Extend on/off"
+  },
+  "shortcut": {
+    "off": "Tablet",
+    "on": "Tablet on",
+    "mirroring": "Mirroring"
+  },
+  "service": {
+    "press_enter": "Press Enter to close",
+    "installing_helper": "Installing the Tablet Display port helper (needs sudo).",
+    "busy": "Still busy: {action}",
+    "timed_out": "'{action}' timed out"
   }
 }

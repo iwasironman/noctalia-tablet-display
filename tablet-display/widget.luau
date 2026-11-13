@@ -3,6 +3,7 @@
 -- opens the panel, right-click toggles Extend.
 
 local common = require("./lib/common.luau")
+local tr = common.tr
 
 local snapshot = common.snapshot()
 
@@ -19,15 +20,15 @@ local function render()
   end
   barWidget.setText("")
 
-  local rows = { { "Tablet Display", common.statusLine(snapshot) } }
+  local rows = { { tr("title"), common.statusLine(snapshot) } }
   local client = common.clientLine(snapshot)
   if client ~= "" then
-    table.insert(rows, { "Moonlight", client })
+    table.insert(rows, { tr("panel.moonlight"), client })
   end
   if problem then
-    table.insert(rows, { "Problem", tostring((snapshot.errors or {})[1] or "see the panel") })
+    table.insert(rows, { tr("widget.problem"), tostring((snapshot.errors or {})[1] or tr("widget.see_panel")) })
   end
-  table.insert(rows, { "", "Click: panel · Right-click: Extend on/off" })
+  table.insert(rows, { "", tr("widget.hint") })
   barWidget.setTooltip(rows)
 end
 
