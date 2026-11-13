@@ -1,7 +1,7 @@
 [[plugin]]
 id           = "iwasironman/tablet-display"
 name         = "Tablet Display"
-version      = "0.2.0"
+version      = "0.3.0"
 author       = "iwasironman"
 license      = "MIT"
 icon         = "device-tablet"
@@ -9,4 +9,4 @@ description  = "Use an Android tablet or iPad as an extended or mirrored display
 deprecated   = false
 plugin_api   = 43
 tags         = ["bar", "panel", "service", "shortcut", "hardware", "utility", "niri", "hyprland", "sway", "mangowc"]
-dependencies = ["sunshine", "jq", "python3", "pkexec"]
+dependencies = ["sunshine", "jq", "python3", "pkexec", "nmcli"]

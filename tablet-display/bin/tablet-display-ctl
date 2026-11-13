@@ -62,7 +62,7 @@ DEFAULT_SETTINGS='{
   "position": "right", "scale": "auto",
   "device": "auto", "customResolution": "2560x1600", "customDiagonal": 0,
   "refreshRates": "60,90,120", "audio": false, "method": "auto", "port": "auto",
-  "keepSunshine": false,
+  "keepSunshine": false, "usbKeepInternet": true,
   "workingPort": null, "lastClient": null
 }'
 EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
@@ -695,6 +695,54 @@ apply_conf() { # output_name
     "$MARK_END")"
 }
 
+# ---------------------------------------------------------------- USB tethering
+#
+# With USB tethering on, the tablet shows up as a network adapter: rndis_host
+# (Samsung), cdc_ncm / cdc_ether (other Android devices) or ipheth (iPad).
+# Moonlight then reaches Sunshine over the cable.
+
+USB_DRIVERS="rndis_host cdc_ncm cdc_ether ipheth"
+
+# [{iface, ip, driver, speed (Mbit/s), defaultRoute}]
+usb_links() {
+  local i n d ip spd dev out=()
+  for i in /sys/class/net/*; do
+    n=${i##*/}
+    d=$(basename "$(readlink -f "$i/device/driver" 2>/dev/null)" 2>/dev/null)
+    [[ " $USB_DRIVERS " == *" $d "* ]] || continue
+    ip=$(ip -4 -o addr show dev "$n" scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')
+    [[ -n $ip ]] || continue
+    # The interface's device is the USB interface; its parent has the speed.
+    dev=$(readlink -f "$i/device/..")
+    spd=$(cat "$dev/speed" 2>/dev/null || echo 0)
+    out+=("$(jq -cn --arg n "$n" --arg ip "$ip" --arg d "$d" --argjson s "${spd:-0}" \
+      --argjson r "$(ip route show default dev "$n" 2>/dev/null | grep -q . && echo true || echo false)" \
+      '{iface: $n, ip: $ip, driver: $d, speed: $s, defaultRoute: $r}')")
+  done
+  printf '%s\n' "${out[@]}" | jq -cs 'map(select(. != null))'
+}
+
+# Tethering makes the tablet a gateway, and NetworkManager prefers wired
+# links, so the computer's internet traffic would go through the tablet.
+# Take the default route off the USB link for the current connection only
+# (nothing is saved; it resets when the cable is unplugged), and only when
+# another default route exists, so this can never cut the computer off.
+usb_keep_internet() {
+  [[ $(setting usbKeepInternet) == true ]] || return 0
+  command -v nmcli >/dev/null || return 0
+  local links n other
+  links=$(usb_links)
+  other=$(ip route show default 2>/dev/null | grep -vE "dev ($(jq -r 'map(.iface) | join("|")' <<<"$links"))( |$)" | grep -c . || true)
+  ((other > 0)) || return 0
+  for n in $(jq -r '.[] | select(.defaultRoute) | .iface' <<<"$links"); do
+    if nmcli device modify "$n" ipv4.never-default yes ipv6.never-default yes >>"$LOG" 2>&1; then
+      log "usb: $n no longer carries the default route"
+    else
+      log "usb: nmcli could not modify $n"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------- operations
 
 remove_display() { # session-json
@@ -881,6 +929,8 @@ print_state() {
     --argjson hCur "$(helper_current && echo true || echo false)" \
     --argjson hNeed "$helper_needed" \
     --arg comp "$COMP" --arg method "$method" --arg scale "$(current_scale)" \
+    --argjson usb "$(usb_links)" \
+    --argjson fw "$( (command -v ufw || command -v firewall-cmd) >/dev/null 2>&1 && echo true || echo false)" \
     --arg host "$(cat /etc/hostname 2>/dev/null || hostname)" \
     --arg addrs "$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(tailscale|docker|br-|veth|virbr)/ {split($4, a, "/"); print a[1]}' | paste -sd' ')" \
     '{
@@ -894,7 +944,9 @@ print_state() {
       monitor: ($mons | map(select(.name == $s.target)) | .[0]
                 | if . then {name, width: .pw, height: .ph, refresh: (.refresh * 1000 | round / 1000), scale} else null end),
       monitors: ($mons | map(select(.enabled and .name != $s.output) | .name)),
-      host: $host, addresses: ($addrs | split(" ") | map(select(. != "")))
+      host: $host,
+      usb: $usb, firewall: $fw,
+      addresses: ($addrs | split(" ") | map(select(. != "")) | map(select(. as $a | $usb | map(.ip) | index($a) | not)))
     }
     | .hint = (
         if .client and .monitor then
@@ -910,6 +962,7 @@ print_state() {
 
 cmd_state() {
   ensure_env
+  usb_keep_internet
   if [[ ${1:-} != --no-reconcile ]]; then
     exec 9>"$LOCK"
     if flock -w 0.3 9; then reconcile; fi
@@ -942,9 +995,10 @@ cmd_configure() { # json
       customDiagonal: ((.customDiagonal // 0) | tonumber? // 0),
       refreshRates: (.refreshRates // "60,90,120"), audio: (.audio == true),
       method: (.method // "auto"), port: (.port // "auto"),
-      keepSunshine: (.keepSunshine == true)
+      keepSunshine: (.keepSunshine == true),
+      usbKeepInternet: (.usbKeepInternet != false)
     }' <<<"$1") || { echo "configure: invalid JSON" >&2; return 64; }
-  old=$(settings | jq -c '{device, customResolution, customDiagonal, refreshRates, audio, method, port, keepSunshine}')
+  old=$(settings | jq -c '{device, customResolution, customDiagonal, refreshRates, audio, method, port, keepSunshine, usbKeepInternet}')
   [[ $new == "$old" ]] && return 0
   update_settings '. + $n' --argjson n "$new"
   s=$(session); mode=$(jq -r .mode <<<"$s")
@@ -953,7 +1007,7 @@ cmd_configure() { # json
     # Only Sunshine reads this, and only at start.
     apply_conf "$(jq -r .target <<<"$s")" && restart_sunshine
   fi
-  if [[ $mode == extend && $(jq -c 'del(.audio, .keepSunshine)' <<<"$new") != $(jq -c 'del(.audio, .keepSunshine)' <<<"$old") ]]; then
+  if [[ $mode == extend && $(jq -c 'del(.audio, .keepSunshine, .usbKeepInternet)' <<<"$new") != $(jq -c 'del(.audio, .keepSunshine, .usbKeepInternet)' <<<"$old") ]]; then
     set_notice "Turn the tablet display off and on again to apply the new device settings."
   fi
 }
@@ -978,6 +1032,17 @@ cmd_doctor() {
   echo "profile:          $(profile)"
   echo "edid:             $([[ -f $EDID ]] && cat "$EDID_ARGS" || echo 'not built yet')"
   if command -v ufw >/dev/null; then echo "firewall:         ufw is installed; Sunshine needs TCP 47984,47989,47990,48010 and UDP 47998-48000 open"; fi
+  local links
+  links=$(usb_links)
+  if [[ $(jq length <<<"$links") -gt 0 ]]; then
+    jq -r '.[] | "usb link:         \(.iface) (\(.driver), \(.speed) Mbit/s) at \(.ip)\(if .defaultRoute then ", carrying the default route" else "" end)"' <<<"$links"
+    if command -v ufw >/dev/null; then
+      echo "                  If Moonlight can't connect over USB, allow Sunshine on the link:"
+      jq -r '.[] | "                    sudo ufw allow in on \(.iface) proto tcp to any port 47984,47989,47990,48010\n                    sudo ufw allow in on \(.iface) proto udp to any port 47998:48000"' <<<"$links"
+    fi
+  else
+    echo "usb link:         none (turn on USB tethering on the tablet to stream over the cable)"
+  fi
   if command -v firewall-cmd >/dev/null; then echo "firewall:         firewalld is installed; open the same Sunshine ports"; fi
   [[ $COMP == niri ]] && cat <<'NIRI'
 touch on niri:    niri can only map touch to a monitor from its config. For
