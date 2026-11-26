@@ -820,6 +820,20 @@ conf_has_our_hook() {
   return 1
 }
 
+backup_valid() {
+  jq -e 'type == "object" and (.other | type == "array" and all(type == "string")) and (.prep | type == "array" and all(type == "string"))' "$CONF_BACKUP" >/dev/null 2>&1
+}
+
+# True iff apply_conf merged the last backed-up global_prep_cmd line into its
+# own (it merges only the last line, and only when its value is a JSON array);
+# also true when there was none.
+backup_last_prep_merged() {
+  local val
+  [[ $(jq -r '.prep | length' "$CONF_BACKUP") != 0 ]] || return 0
+  val=$(jq -r '.prep[-1]' "$CONF_BACKUP" | sed -E 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//')
+  strip_our_hook_json "$val" >/dev/null
+}
+
 conf_is_managed() { conf_has_markers || [[ -f $CONF_BACKUP ]] || conf_has_our_hook; }
 
 conf_managed_reason() {
@@ -837,7 +851,10 @@ conf_managed_reason() {
 # strips all comments), fall back to $CONF_BACKUP: all non-managed Web UI edits
 # are preserved, output_name/capture/stream_audio revert to their pre-session
 # values, and only our hook is stripped from global_prep_cmd (if the user
-# deleted global_prep_cmd in the Web UI, it stays absent).
+# deleted global_prep_cmd in the Web UI, it stays absent). The user's original
+# global_prep_cmd lines come back from the backup when apply_conf could not
+# merge them (several lines, or a value that is not a JSON array). A corrupt
+# backup is moved aside and only our hook is stripped.
 restore_conf() {
   if [[ ! -f $SUNSHINE_CONF ]]; then
     rm -f "$CONF_BACKUP"
@@ -846,6 +863,14 @@ restore_conf() {
   conf_is_managed || return 0
 
   local out=""
+  if ! conf_has_markers && [[ -f $CONF_BACKUP ]] && ! backup_valid; then
+    # Without markers a corrupt backup is useless: move it aside so it can't
+    # block every later start and reconcile, and fall back to stripping our hook.
+    mv -f "$CONF_BACKUP" "$CONF_BACKUP.corrupt" || return 1
+    log "restore_conf: corrupt backup moved to $CONF_BACKUP.corrupt"
+    add_error "Could not fully restore $SUNSHINE_CONF (backup was corrupt); check output_name, capture and stream_audio"
+    conf_has_our_hook || return 0
+  fi
   if conf_has_markers; then
     out=$(awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v p="$DISABLED_PREFIX" '
       $0 == b { skip = 1; next }
@@ -857,23 +882,27 @@ restore_conf() {
     # Drop the blank line apply_conf added before the block.
     out=$(printf '%s\n' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
   elif [[ -f $CONF_BACKUP ]]; then
-    # Markers were stripped (e.g. saved via Sunshine's Web UI): validate backup
-    # first so a corrupt backup never silently drops the user's original keys.
-    if ! jq -e 'type == "object" and (.other | type == "array" and all(type == "string")) and (.prep | type == "array" and all(type == "string"))' "$CONF_BACKUP" >/dev/null 2>&1; then
-      log "restore_conf: corrupt backup $CONF_BACKUP; leaving it in place"
-      return 1
-    fi
-    local body existing_prep filtered_prep restored_other restored_prep extra=""
+    # Markers were stripped (e.g. saved via Sunshine's Web UI); the backup was
+    # validated above.
+    local body existing_prep filtered_prep restored_other restored_prep extra="" live_prep="" earlier_prep
     body=$(awk -v keys="^[[:space:]]*($MANAGED_KEYS)[[:space:]]*=" '$0 ~ keys { next } { print }' "$SUNSHINE_CONF") || return 1
     restored_other=$(jq -r '(.other // [])[]' "$CONF_BACKUP") || return 1
     existing_prep=$(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF" | tail -1)
-    restored_prep=""
-    if [[ -n $existing_prep ]]; then
-      if filtered_prep=$(strip_our_hook_json "$existing_prep"); then
-        [[ $filtered_prep != "[]" ]] && restored_prep="global_prep_cmd = $filtered_prep"
-      else
-        restored_prep=$(jq -r '(.prep // [])[]' "$CONF_BACKUP") || return 1
-      fi
+    # apply_conf merged only the user's last global_prep_cmd line, and only if
+    # it was a JSON array, so the live value (which the Web UI may have edited)
+    # speaks for that line alone. Earlier lines, and an unmerged last line,
+    # never reached the live value: only the backup still has them.
+    earlier_prep=$(jq -r '(.prep // [])[:-1][]' "$CONF_BACKUP") || return 1
+    if [[ -n $existing_prep ]] && filtered_prep=$(strip_our_hook_json "$existing_prep"); then
+      [[ $filtered_prep != "[]" ]] && live_prep="global_prep_cmd = $filtered_prep"
+    fi
+    restored_prep=$earlier_prep
+    if [[ -n $live_prep ]]; then
+      restored_prep="${restored_prep:+$restored_prep$'\n'}$live_prep"
+    elif ! backup_last_prep_merged || { [[ -n $existing_prep ]] && [[ -z $filtered_prep ]]; }; then
+      # The last line was never merged, or the live value is unparseable:
+      # put the user's original last line back.
+      restored_prep="${restored_prep:+$restored_prep$'\n'}$(jq -r '.prep[-1] // empty' "$CONF_BACKUP")" || return 1
     fi
     [[ -n $restored_other ]] && extra="$restored_other"
     if [[ -n $restored_prep ]]; then
