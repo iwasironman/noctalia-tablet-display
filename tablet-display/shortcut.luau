@@ -18,7 +18,7 @@ local function render()
   shortcut.setLabel(label)
   shortcut.setIcon("device-tablet")
   shortcut.setActive(active)
-  shortcut.setEnabled(not pending and snapshot.installed ~= false)
+  shortcut.setEnabled(not pending and snapshot.available ~= false and snapshot.installed ~= false)
 end
 
 noctalia.state.watch(common.STATE_KEY, function(value)

@@ -1393,8 +1393,9 @@ cmd_repair_sunshine() { # stale|active
 }
 
 print_state() {
-  local s st mons method="" helper_needed=false
-  s=$(session); st=$(settings)
+  local s st mons prof auto_sc method="" helper_needed=false
+  s=$(session); st=$(settings); prof=$(profile)
+  auto_sc=$(auto_scale "$(jq -r .w <<<"$prof")" "$(jq -r .h <<<"$prof")" "$(jq -r .diag <<<"$prof")")
   [[ -n $COMP ]] || COMP=$(detect_compositor)
   mons=$(monitors_json)
   method=$(jq -r '.method // empty' <<<"$s")
@@ -1402,13 +1403,13 @@ print_state() {
   [[ $method == port ]] && helper_needed=true
 
   jq -cn \
-    --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson prof "$(profile)" \
+    --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson prof "$prof" \
     --argjson installed "$(sunshine_installed && echo true || echo false)" \
     --argjson running "$(sunshine_running && echo true || echo false)" \
     --argjson hInst "$(helper_installed && echo true || echo false)" \
     --argjson hCur "$(helper_current && echo true || echo false)" \
     --argjson hNeed "$helper_needed" \
-    --arg comp "$COMP" --arg method "$method" --arg scale "$(current_scale)" \
+    --arg comp "$COMP" --arg method "$method" --arg scale "$(current_scale)" --arg autoScale "$auto_sc" \
     --argjson usb "$(usb_links)" \
     --argjson fw "$( (command -v ufw || command -v firewall-cmd) >/dev/null 2>&1 && echo true || echo false)" \
     --arg host "$(cat /etc/hostname 2>/dev/null || hostname)" \
@@ -1418,7 +1419,7 @@ print_state() {
       mode: $s.mode, busy: $s.busy, method: $method, compositor: $comp,
       output: $s.output, port: $s.port, target: $s.target,
       client: $s.client, errors: $s.errors, notice: $s.notice,
-      position: $st.position, scaleSetting: $st.scale, scale: $scale, audio: $st.audio,
+      position: $st.position, scaleSetting: $st.scale, scale: $scale, autoScale: $autoScale, audio: $st.audio,
       profile: $prof,
       helper: {needed: $hNeed, installed: $hInst, current: $hCur},
       monitor: ($mons | map(select(.name == $s.target)) | .[0]
