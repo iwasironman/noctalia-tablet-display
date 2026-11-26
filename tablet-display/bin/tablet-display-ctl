@@ -720,6 +720,7 @@ apply_display() { # output method
       done
       ;;
     *)
+      command -v wlr-randr >/dev/null 2>&1 || { add_error "wlr-randr is not installed (required on $COMP)"; return 1; }
       # mango re-arranges every monitor when one changes mode, so the other
       # monitors drift. Pin them at the positions they had when Extend
       # started ("home"), place the tablet against those, and send it all in
@@ -1285,6 +1286,12 @@ do_start() { # mode [target]
   update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
+  if [[ $COMP == sway || $COMP == mango || $COMP == wlr ]] && ! command -v wlr-randr >/dev/null 2>&1; then
+    add_error "wlr-randr is not installed (required on $COMP). Install wlr-randr with your package manager."
+    update_session '.busy = ""'
+    return 1
+  fi
+
   release_orphans --retry && sleep 0.3
   if [[ $mode == extend ]]; then
     # Where the real monitors are before the tablet appears; placement pins
@@ -1600,6 +1607,9 @@ cmd_doctor() {
   echo "== $APP doctor"
   echo "compositor:       $COMP"
   echo "extend method:    $(choose_method)"
+  if [[ $COMP == sway || $COMP == mango || $COMP == wlr ]]; then
+    echo "wlr-randr:        $(command -v wlr-randr || echo 'NOT INSTALLED')"
+  fi
   echo "sunshine:         $(command -v sunshine || echo 'NOT INSTALLED')"
   echo "sunshine running: $(sunshine_running && echo yes || echo no)"
   echo "systemd unit:     $(sunshine_has_unit && echo "$SUNSHINE_UNIT ($(systemctl --user is-active "$SUNSHINE_UNIT"))" || echo none)"

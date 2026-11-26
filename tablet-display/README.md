@@ -30,6 +30,7 @@ but haven't been tested; reports are welcome.
 - `sunshine`: from your distribution (`sudo pacman -S sunshine` on Arch and
   CachyOS) or [LizardByte's releases](https://github.com/LizardByte/Sunshine/releases).
 - `jq` and `python3` on `PATH`. `python3` generates the display's EDID.
+- `wlr-randr`, only on sway, mango, or other wlroots compositors (used to read and configure outputs).
 - `pkexec` (polkit), only on compositors that need the port method below.
 - `nmcli` (NetworkManager), only for USB mode: it keeps your internet off the
   USB cable (see [USB mode](#usb-mode)).
