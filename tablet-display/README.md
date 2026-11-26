@@ -216,6 +216,23 @@ $CTL uninstall      # turn off, restore sunshine.conf, delete state
   as your laptop screen.
 - **120 Hz at full resolution** needs a lot of bandwidth. If the frame rate
   wanders, stream at 90 fps or pick a lower resolution in Moonlight.
+- **Black picture in Moonlight.** If Moonlight connects but shows only black,
+  in both Extend and Mirror, check which encoder Sunshine uses: `doctor`
+  prints it as `sunshine encoder`. Sunshine tries Vulkan first, and after a
+  driver update its Vulkan encoder can send black frames (seen with Mesa
+  26.3.1 and Sunshine 2026.1123 on a Radeon 780M). Switch to VA-API by adding
+  these lines to `~/.config/sunshine/sunshine.conf`, then turn the display off
+  and on:
+
+  ```ini
+  encoder = vaapi
+  adapter_name = /dev/dri/renderD129
+  ```
+
+  `adapter_name` matters on laptops with two GPUs. Use the render node of the
+  GPU that drives your screen: `ls -l /dev/dri/by-path` lists each node with
+  its PCI address. The plugin leaves both lines alone. `encoder = software`
+  is a quick test, but too slow for full resolution at high frame rates.
 - **Touch and placement.** Sunshine maps touch onto a desktop it assumes
   starts at 0,0, and refuses a display at a negative position. So the plugin
   always lays the monitors out from 0,0: for **Left** and **Above** it moves

@@ -891,6 +891,19 @@ sunshine_age() { # [pid]
   ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' '
 }
 
+# The encoders Sunshine picked at its last start (from its log), e.g.
+# "H.264=h264_vaapi HEVC=hevc_vaapi AV1=av1_vaapi".
+sunshine_encoders() {
+  local src
+  if sunshine_has_unit; then
+    src=$(journalctl --user -u "$SUNSHINE_UNIT" -n 3000 --no-pager -o cat 2>/dev/null)
+  else
+    src=$(tail -n 3000 "$RUN_DIR/sunshine.log" 2>/dev/null)
+  fi
+  grep -oE 'Found (H\.264|HEVC|AV1) encoder: [^ ]+' <<<"$src" | tail -3 \
+    | sed -E 's/^Found (.*) encoder: /\1=/' | paste -sd' '
+}
+
 sunshine_log_hint() {
   if sunshine_has_unit; then
     echo "journalctl --user -u $SUNSHINE_UNIT"
@@ -1684,6 +1697,14 @@ cmd_doctor() {
   echo "sunshine running: $(sunshine_running && echo yes || echo no)"
   echo "systemd unit:     $(sunshine_has_unit && echo "$SUNSHINE_UNIT ($(systemctl --user is-active "$SUNSHINE_UNIT"))" || echo none)"
   echo "sunshine hook:    $HOOK -> $CTL"
+  local enc_set enc_used
+  enc_set=$(sed -nE 's/^[[:space:]]*encoder[[:space:]]*=[[:space:]]*([^[:space:]]+).*/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
+  enc_used=$(sunshine_encoders)
+  echo "sunshine encoder: ${enc_set:-auto} (last used: ${enc_used:-unknown})"
+  if [[ $enc_used == *vulkan* ]]; then
+    echo "                  If Moonlight shows only black, Vulkan encoding may be broken on this"
+    echo "                  driver; set encoder = vaapi in sunshine.conf (see the README's Notes)."
+  fi
   echo "sunshine.conf:    $SUNSHINE_CONF ($(conf_is_managed && echo "managed ($(conf_managed_reason))" || echo untouched))"
   echo "port helper:      $(helper_installed && echo "installed (version $("$HELPER" version), $(helper_current && echo current || echo OUTDATED))" || echo 'not installed')"
   echo "kernel lockdown:  $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unknown)"
