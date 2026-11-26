@@ -81,6 +81,9 @@ EDID_ARGS="$STATE_DIR/edid.args"
 # file, which would abort every stream.
 HOOK="$STATE_DIR/sunshine-hook"
 CONF_BACKUP="$STATE_DIR/sunshine-conf-backup.json"
+# A copy of this script kept beside the hook, so the hook can still restore
+# sunshine.conf properly (restore_conf) after the plugin is removed.
+RESTORE_COPY="$STATE_DIR/restore-conf"
 SESSION="$RUN_DIR/session.json"
 LOCK="$RUN_DIR/lock"
 LOG="$RUN_DIR/ctl.log"
@@ -103,7 +106,7 @@ DEFAULT_SETTINGS='{
   "keepSunshine": false, "usbKeepInternet": true,
   "workingPort": null, "lastClient": null
 }'
-EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"listenRetried":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
+EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"listenRetried":false,"sunshineRestartPending":false,"repairSpawnedAt":0,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
 
 mkdir -p "$STATE_DIR" "$RUN_DIR"
 
@@ -1142,8 +1145,13 @@ restore_conf() {
 # Sunshine runs prep commands directly, without a shell, and aborts the
 # stream when one fails. While the plugin exists this hands over to it. If the
 # plugin was removed, it puts sunshine.conf back and exits 0 so streaming
-# keeps working.
+# keeps working: through the saved copy of this script when bash and jq are
+# there (that handles a conf the Web UI rewrote, which loses our markers),
+# else by deleting the marked block with sed.
 write_hook() {
+  local tmp
+  tmp=$(mktemp "$RESTORE_COPY.XXXXXX") && cp -f "$CTL" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$RESTORE_COPY" \
+    || { rm -f "$tmp"; log "write_hook: could not save $RESTORE_COPY"; }
   write_atomic "$HOOK" "$(cat <<HOOK_EOF
 #!/bin/sh
 # Written by $APP. Sunshine runs this when a Moonlight session starts or ends.
@@ -1152,6 +1160,12 @@ $(for v in TABLET_DISPLAY_STATE_DIR TABLET_DISPLAY_RUN_DIR TABLET_DISPLAY_SUNSHI
   done)
 ctl='$CTL'
 if [ -f "\$ctl" ]; then exec bash "\$ctl" "\$@"; fi
+copy='$RESTORE_COPY'
+if [ -f "\$copy" ] && command -v bash >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \\
+  && TABLET_DISPLAY_STATE_DIR='$STATE_DIR' TABLET_DISPLAY_SUNSHINE_CONF='$SUNSHINE_CONF' \\
+     bash "\$copy" restore-orphaned >/dev/null 2>&1; then
+  exit 0
+fi
 conf='$SUNSHINE_CONF'
 [ -f "\$conf" ] && sed -i -e '/^# >>> $APP:/,/^# <<< $APP\$/d' -e 's/^#$APP# //' "\$conf"
 exit 0
@@ -1313,7 +1327,7 @@ do_start() { # mode [target]
   fi
 
   COMP=$(detect_compositor)
-  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, compositor: $c, env: $e}' \
+  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, sunshineRestartPending: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
   if [[ $COMP == sway || $COMP == mango || $COMP == wlr ]] && ! command -v wlr-randr >/dev/null 2>&1; then
@@ -1436,12 +1450,17 @@ reconcile() {
         [[ -f $SUNSHINE_CONF ]] && after=$(cat "$SUNSHINE_CONF")
         if [[ $before != "$after" ]] && sunshine_running; then
           stop_sunshine
-          # Restart detached so `state` never trips service.luau's 15s poll timeout.
-          setsid -f bash "$CTL" repair-sunshine stale >>"$LOG" 2>&1 </dev/null 9>&-
+          # Restart detached so `state` never trips service.luau's 15s poll
+          # timeout. The flag survives a repair that loses the lock, so a
+          # later poll tries again instead of leaving Sunshine stopped.
+          update_session '.sunshineRestartPending = true'
+          spawn_repair stale
         fi
       else
         log "reconcile: failed to restore $SUNSHINE_CONF"
       fi
+    elif [[ $(jq -r '.sunshineRestartPending == true' <<<"$s") == true ]] && ! sunshine_running; then
+      spawn_repair stale
     fi
     release_orphans && { sleep 0.3; rebase_layout; }
     return 0
@@ -1492,18 +1511,36 @@ reconcile() {
   p=$(sunshine_port)
   if [[ -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
     log "reconcile: sunshine (pid $pid) up ${age}s but not listening on $p/$((p + 21)); scheduling restart"
-    update_session '.listenRetried = true'
-    setsid -f bash "$CTL" repair-sunshine active >>"$LOG" 2>&1 </dev/null 9>&-
+    # listenRetried is set by the repair itself once it holds the lock, so a
+    # repair that loses the lock doesn't use up the session's one retry.
+    spawn_repair active
   fi
 
   map_input_devices "$target"
+}
+
+# Starts a detached `repair-sunshine` at most once per REPAIR_COOLDOWN
+# seconds: reconcile runs on every poll, and a repair can wait 5s for the
+# lock and then take up to ~35s.
+REPAIR_COOLDOWN=45
+spawn_repair() { # stale|active
+  local last now
+  now=$(date +%s)
+  last=$(session | jq -r '.repairSpawnedAt // 0 | floor' 2>/dev/null)
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  ((now - last < REPAIR_COOLDOWN)) && return 0
+  update_session '.repairSpawnedAt = $t' --argjson t "$now"
+  setsid -f bash "$CTL" repair-sunshine "$1" >>"$LOG" 2>&1 </dev/null 9>&-
 }
 
 # Detached Sunshine restart spawned by reconcile so `state` polls stay fast.
 cmd_repair_sunshine() { # stale|active
   local kind=$1 s pid p
   if [[ $kind == stale ]]; then
-    [[ $(session | jq -r .mode) == off ]] || return 0
+    s=$(session)
+    [[ $(jq -r '.sunshineRestartPending == true' <<<"$s") == true ]] || return 0
+    update_session '.sunshineRestartPending = false'
+    [[ $(jq -r .mode <<<"$s") == off ]] || return 0
     sunshine_running && return 0
     restart_sunshine 1 7 15 || true
     return 0
@@ -1511,10 +1548,11 @@ cmd_repair_sunshine() { # stale|active
   [[ $kind == active ]] || return 0
   s=$(session)
   [[ $(jq -r .mode <<<"$s") != off && -z $(jq -r .busy <<<"$s") ]] || return 0
+  [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] || return 0
   pid=$(sunshine_pid)
   p=$(sunshine_port)
   [[ -n $pid ]] && ! sunshine_listening "$p" "$pid" || return 0
-  update_session '.busy = "restarting"'
+  update_session '.listenRetried = true | .busy = "restarting"'
   if restart_sunshine 2 7 30; then
     update_session '.busy = "" | .notice = $m' --arg m "Sunshine wasn't accepting connections, so it was restarted. Reconnect Moonlight."
   else
@@ -1714,7 +1752,14 @@ case "${1:-}" in
   configure) [[ $# -eq 2 ]] || usage; ensure_env; LOCK_WAIT=10 with_lock cmd_configure "$2" ;;
   hook-start) LOCK_WAIT=5 with_lock hook_start; exit 0 ;;
   hook-stop) LOCK_WAIT=5 with_lock hook_stop; exit 0 ;;
-  repair-sunshine) ensure_env; LOCK_WAIT=5 with_lock cmd_repair_sunshine "${2:-}" ;;
+  repair-sunshine)
+    ensure_env
+    LOCK_WAIT=5 with_lock cmd_repair_sunshine "${2:-}"
+    rc=$?
+    # reconcile will try again after its cooldown (see spawn_repair).
+    ((rc == 75)) && log "repair-sunshine ${2:-}: lock busy for 5s; skipped, will retry"
+    exit $rc
+    ;;
   pair) open_admin /pin ;;
   admin) open_admin ;;
   clear-errors) with_lock update_session '.errors = [] | .notice = ""' ;;
@@ -1732,6 +1777,12 @@ case "${1:-}" in
     fi
     rm -rf "$STATE_DIR" "$RUN_DIR"
     echo "$APP: turned off, sunshine.conf restored, state removed."
+    ;;
+  restore-orphaned)
+    # Run by the hook from $RESTORE_COPY once the plugin is gone; never from
+    # the plugin itself, which restores the conf through teardown.
+    [[ $CTL == "$(realpath -m "$RESTORE_COPY")" ]] || usage
+    LOCK_WAIT=5 with_lock restore_conf
     ;;
   doctor) cmd_doctor ;;
   *) usage ;;
