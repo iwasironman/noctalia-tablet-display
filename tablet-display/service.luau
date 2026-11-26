@@ -136,6 +136,13 @@ local function pushConfig(thenPoll)
     else
       local timedOut = not result or result.timedOut
       local busy = result and result.exitCode == 75
+      if not busy then
+        -- cmd_configure writes the settings before it restarts Sunshine, so a
+        -- failed or timed-out run may have applied `json`. The script's state
+        -- is unknown now: forget lastConfig so the next push (even of the old
+        -- settings) is sent instead of being skipped as unchanged.
+        lastConfig = ""
+      end
       if timedOut or busy then
         if configRetries < MAX_CONFIG_RETRIES then
           configRetries = configRetries + 1
