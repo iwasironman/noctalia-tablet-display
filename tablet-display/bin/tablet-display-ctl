@@ -651,7 +651,45 @@ stop_sunshine() {
   pkill -9 -x sunshine 2>/dev/null
 }
 
+# Sunshine's HTTP port (Moonlight's first contact). `port` in sunshine.conf
+# moves the whole range; 47989 is the default.
+sunshine_port() {
+  local p
+  p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
+  echo "${p:-47989}"
+}
+sunshine_listening() { ss -tlnH "sport = :$(sunshine_port)" 2>/dev/null | grep -q .; }
+
+# Seconds since the Sunshine process started, or nothing if it isn't running.
+sunshine_age() { ps -o etimes= -p "$(pgrep -x sunshine | head -1)" 2>/dev/null | tr -d ' '; }
+
+# Waits for Sunshine to accept Moonlight connections. A running process isn't
+# enough: if a port is still held (for example by the previous instance's
+# stream), Sunshine logs "Couldn't bind ... Address already in use", keeps
+# only its web UI, and Moonlight can't connect.
+wait_sunshine_listening() { # seconds
+  local i
+  for ((i = 0; i < $1 * 10; i++)); do
+    sunshine_listening && return 0
+    sunshine_running || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
 restart_sunshine() {
+  local try
+  for try in 1 2 3; do
+    _restart_sunshine_once || return 1
+    wait_sunshine_listening 10 && return 0
+    log "sunshine: running but not listening on $(sunshine_port) (try $try); restarting"
+    sleep $((try * 2))
+  done
+  add_error "Sunshine started but isn't accepting Moonlight connections (port $(sunshine_port) or 48010 may be in use; see: journalctl --user -u app-dev.lizardbyte.app.Sunshine)"
+  return 1
+}
+
+_restart_sunshine_once() {
   stop_sunshine
   if sunshine_has_unit; then
     # The unit gets systemd's user environment, which holds whatever session
@@ -957,6 +995,17 @@ reconcile() {
       apply_display "$out" "$(jq -r .method <<<"$s")"
     fi
   fi
+  # Sunshine can be running yet not accepting connections (a port was still
+  # in use when it started). Give a fresh start time to bind, then restart.
+  local age
+  age=$(sunshine_age)
+  if [[ -n $age ]] && ((age > 20)) && ! sunshine_listening; then
+    log "reconcile: sunshine up ${age}s but not listening on $(sunshine_port); restarting"
+    if restart_sunshine; then
+      set_notice "Sunshine wasn't accepting connections, so it was restarted. Reconnect Moonlight."
+    fi
+  fi
+
   map_input_devices "$target"
 }
 
