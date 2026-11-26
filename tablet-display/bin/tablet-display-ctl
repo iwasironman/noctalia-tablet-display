@@ -419,10 +419,13 @@ wait_for_monitor() { # name seconds
 # Forces a port on and waits for the compositor to show it. Prints the output
 # name. Tries up to three candidates when the port is "auto".
 port_on() {
-  local c out tries=0 timed_out=() err
+  local c out tries=0 timed_out=() err cands=()
   helper_installed || { add_error "The port helper is not installed. Open the panel and choose Install helper."; return 1; }
   build_edid || return 1
-  while IFS= read -r c; do
+  # Read the list up front: commands in the loop (pkexec, the compositor's
+  # CLI) must not inherit, and possibly consume, the candidates as stdin.
+  mapfile -t cands < <(port_candidates)
+  for c in "${cands[@]}"; do
     [[ -n $c ]] || continue
     ((tries++ < 3)) || break
     out=${c#*-}
@@ -442,7 +445,7 @@ port_on() {
     log "port: $c did not appear in the compositor"
     timed_out+=("$c")
     pkexec "$HELPER" off "$c" >>"$LOG" 2>&1
-  done < <(port_candidates)
+  done
   if ((tries == 0)); then
     add_error "No free display port found (all are in use)"
   elif ((${#timed_out[@]})); then
