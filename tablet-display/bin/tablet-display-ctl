@@ -652,40 +652,63 @@ stop_sunshine() {
 }
 
 # Sunshine's HTTP port (Moonlight's first contact). `port` in sunshine.conf
-# moves the whole range; 47989 is the default.
+# moves the whole range; 47989 is the default (RTSP is port + 21 = 48010).
 sunshine_port() {
   local p
   p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
   echo "${p:-47989}"
 }
-sunshine_listening() { ss -tlnH "sport = :$(sunshine_port)" 2>/dev/null | grep -q .; }
+sunshine_listening() { # [port]
+  command -v ss >/dev/null || return 0
+  local p=${1:-$(sunshine_port)} rtsp out
+  rtsp=$((p + 21))
+  out=$(ss -tlnH "( sport = :$p or sport = :$rtsp )" 2>/dev/null) || return 0
+  [[ $out =~ :${p}[[:space:]] && $out =~ :${rtsp}[[:space:]] ]]
+}
 
 # Seconds since the Sunshine process started, or nothing if it isn't running.
-sunshine_age() { ps -o etimes= -p "$(pgrep -x sunshine | head -1)" 2>/dev/null | tr -d ' '; }
+sunshine_age() {
+  local pid
+  pid=$(pgrep -u "$(id -u)" -x sunshine | head -1)
+  [[ -n $pid ]] || return 0
+  ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' '
+}
+
+sunshine_log_hint() {
+  if sunshine_has_unit; then
+    echo "journalctl --user -u $SUNSHINE_UNIT"
+  else
+    echo "$RUN_DIR/sunshine.log"
+  fi
+}
 
 # Waits for Sunshine to accept Moonlight connections. A running process isn't
 # enough: if a port is still held (for example by the previous instance's
 # stream), Sunshine logs "Couldn't bind ... Address already in use", keeps
 # only its web UI, and Moonlight can't connect.
-wait_sunshine_listening() { # seconds
-  local i
+wait_sunshine_listening() { # seconds [port]
+  local i p=${2:-$(sunshine_port)}
   for ((i = 0; i < $1 * 10; i++)); do
-    sunshine_listening && return 0
+    sunshine_listening "$p" && return 0
     sunshine_running || return 1
     sleep 0.1
   done
   return 1
 }
 
-restart_sunshine() {
-  local try
-  for try in 1 2 3; do
-    _restart_sunshine_once || return 1
-    wait_sunshine_listening 10 && return 0
-    log "sunshine: running but not listening on $(sunshine_port) (try $try); restarting"
-    sleep $((try * 2))
+restart_sunshine() { # [tries] [wait_secs]
+  local tries=${1:-3} wait_secs=${2:-10} try p
+  p=$(sunshine_port)
+  for ((try = 1; try <= tries; try++)); do
+    if ! _restart_sunshine_once; then
+      add_error "Sunshine failed to start (see: $(sunshine_log_hint))"
+      return 1
+    fi
+    wait_sunshine_listening "$wait_secs" "$p" && return 0
+    log "sunshine: running but not listening on $p/$((p + 21)) (try $try/$tries); restarting"
+    ((try < tries)) && sleep $((try * 2))
   done
-  add_error "Sunshine started but isn't accepting Moonlight connections (port $(sunshine_port) or 48010 may be in use; see: journalctl --user -u app-dev.lizardbyte.app.Sunshine)"
+  add_error "Sunshine started but isn't accepting Moonlight connections (port $p or $((p + 21)) may be in use; see: $(sunshine_log_hint))"
   return 1
 }
 
@@ -915,7 +938,6 @@ do_start() { # mode [target]
     return 1
   fi
   if ! restart_sunshine; then
-    add_error "Sunshine failed to start; see: journalctl --user -u app-dev.lizardbyte.app.Sunshine"
     update_session '.busy = ""'
     return 1
   fi
@@ -997,11 +1019,13 @@ reconcile() {
   fi
   # Sunshine can be running yet not accepting connections (a port was still
   # in use when it started). Give a fresh start time to bind, then restart.
-  local age
+  # Limit to one short attempt here so state polling stays under its 15s timeout.
+  local age p
   age=$(sunshine_age)
-  if [[ -n $age ]] && ((age > 20)) && ! sunshine_listening; then
-    log "reconcile: sunshine up ${age}s but not listening on $(sunshine_port); restarting"
-    if restart_sunshine; then
+  p=$(sunshine_port)
+  if [[ -n $age ]] && ((age > 20)) && ! sunshine_listening "$p"; then
+    log "reconcile: sunshine up ${age}s but not listening on $p/$((p + 21)); restarting"
+    if restart_sunshine 1 6; then
       set_notice "Sunshine wasn't accepting connections, so it was restarted. Reconnect Moonlight."
     fi
   fi
