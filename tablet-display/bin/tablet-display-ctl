@@ -1345,6 +1345,28 @@ reconcile() {
     return 0
   fi
 
+  local pid age p
+  pid=$(sunshine_pid)
+  if [[ -z $pid ]]; then
+    if sunshine_has_unit && [[ $(systemctl --user is-active "$SUNSHINE_UNIT" 2>/dev/null) =~ ^(activating|reloading)$ ]]; then
+      [[ $(jq -r '.client != null' <<<"$s") == true ]] && update_session '.client = null'
+      return 0
+    fi
+    log "reconcile: sunshine stopped"
+    teardown "Sunshine stopped, so the tablet display was turned off." --no-restart
+    return 0
+  fi
+
+  age=$(sunshine_age "$pid")
+  if [[ $(jq -r '.client != null' <<<"$s") == true && $age =~ ^[0-9]+$ ]]; then
+    local since
+    since=$(jq -r 'if (.client | type == "object") and (.client.since | type == "number") then (.client.since | floor) else 0 end' <<<"$s")
+    if ((since > 0 && since + 2 < $(date +%s) - age)); then
+      log "reconcile: clearing stale client (sunshine restarted)"
+      update_session '.client = null'
+    fi
+  fi
+
   if [[ $mode == extend ]]; then
     local now applied
     now=$(monitor_signature "$out"); applied=$(jq -r .applied <<<"$s")
@@ -1356,11 +1378,8 @@ reconcile() {
   # Sunshine can be running yet not accepting connections (a port was still
   # in use when it started). Give a fresh start time to bind, then schedule
   # one detached restart per session so `state` stays fast and never loops.
-  local pid age p
-  pid=$(sunshine_pid)
-  age=$(sunshine_age "$pid")
   p=$(sunshine_port)
-  if [[ -n $pid && -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
+  if [[ -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
     log "reconcile: sunshine (pid $pid) up ${age}s but not listening on $p/$((p + 21)); scheduling restart"
     update_session '.listenRetried = true'
     setsid -f bash "$CTL" repair-sunshine active >>"$LOG" 2>&1 </dev/null 9>&-
