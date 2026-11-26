@@ -21,9 +21,11 @@ set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-VERSION=2
+VERSION=3
 RUN=/run/noctalia-tablet-display-port
 DEBUGFS=/sys/kernel/debug
+EDID_TMP=""
+trap '[[ -n $EDID_TMP ]] && rm -f "$EDID_TMP"' EXIT
 
 die() { echo "port-helper: $*" >&2; exit 1; }
 
@@ -40,7 +42,7 @@ debugfs_dir() { # card-connector
   pci=$(basename "$(readlink -f "/sys/class/drm/$card/device")")
   mountpoint -q "$DEBUGFS" || mount -t debugfs none "$DEBUGFS" || die "cannot mount debugfs"
   for d in "$DEBUGFS"/dri/*/; do
-    if [[ -f $d/name ]] && grep -q "dev=$pci" "$d/name" && [[ -d $d$name ]]; then
+    if [[ -f $d/name ]] && grep -Fq "dev=$pci" "$d/name" && [[ -d $d$name ]]; then
       echo "$d$name"
       return
     fi
@@ -54,32 +56,37 @@ hotplug() {
   echo "change $(cat /proc/sys/kernel/random/uuid) HOTPLUG=1" >"/sys/class/drm/${1%%-*}/uevent"
 }
 
-read_edid() { # -> path of a validated copy
-  local f="$RUN/edid.$$" size
+read_edid() { # dst_path
+  local f=$1 size bad
   head -c 2048 >"$f"
   size=$(stat -c %s "$f")
-  (( size >= 128 && size <= 1024 && size % 128 == 0 )) || { rm -f "$f"; die "EDID must be 128-1024 bytes in 128-byte blocks (got $size)"; }
-  [[ $(head -c 8 "$f" | od -An -tx1 | tr -d ' \n') == 00ffffffffffff00 ]] || { rm -f "$f"; die "not an EDID (bad header)"; }
-  local bad
+  (( size >= 128 && size <= 1024 && size % 128 == 0 )) || die "EDID must be 128-1024 bytes in 128-byte blocks (got $size)"
+  [[ $(head -c 8 "$f" | od -An -tx1 | tr -d ' \n') == 00ffffffffffff00 ]] || die "not an EDID (bad header)"
   bad=$(od -An -tu1 -v "$f" | tr -s ' ' '\n' | awk 'NF { s += $1; n++; if (n % 128 == 0) { if (s % 256) bad = 1; s = 0 } } END { print bad + 0 }')
-  [[ $bad == 0 ]] || { rm -f "$f"; die "EDID checksum mismatch"; }
-  echo "$f"
+  [[ $bad == 0 ]] || die "EDID checksum mismatch"
 }
 
 cmd_on() {
-  local c=$1 sys dbg edid
+  local c=$1 sys dbg was_forced=0
   check_conn "$c"
   sys=/sys/class/drm/$c
   mkdir -p "$RUN/forced"
-  if [[ ! -e $RUN/forced/$c && $(cat "$sys/status") != disconnected ]]; then
+  if [[ -e $RUN/forced/$c ]]; then
+    was_forced=1
+  elif [[ $(cat "$sys/status") != disconnected ]]; then
     die "$c has something connected; pick a free connector"
   fi
   dbg=$(debugfs_dir "$c")
-  edid=$(read_edid)
-  cat "$edid" >"$dbg/edid_override"
-  rm -f "$edid"
+  EDID_TMP="$RUN/edid.$$"
+  read_edid "$EDID_TMP"
+  cat "$EDID_TMP" >"$dbg/edid_override" || die "cannot write $dbg/edid_override"
+  rm -f "$EDID_TMP"
+  EDID_TMP=""
+  if ! echo on >"$sys/status"; then
+    (( ! was_forced )) && printf reset >"$dbg/edid_override" 2>/dev/null || true
+    die "cannot force $c on"
+  fi
   : >"$RUN/forced/$c"
-  echo on >"$sys/status"
   hotplug "$c"
   echo "$c: $(cat "$sys/status")"
 }
