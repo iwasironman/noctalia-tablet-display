@@ -9,7 +9,10 @@ local COMMAND_KEY = "td_command"
 
 local ACTIVE_INTERVAL_MS = 2000
 local IDLE_INTERVAL_MS = 8000
-local ACTION_TIMEOUT_MS = 60000
+-- extend/mirror can try three ports (~6s each) and then restart Sunshine
+-- (up to ~45s with retries); leave room so a slow but working start isn't
+-- cut off.
+local ACTION_TIMEOUT_MS = 90000
 -- configure waits up to 10s for the script's lock (then exits 75, "busy") and
 -- may restart Sunshine (~20s worst case); leave room for both.
 local CONFIGURE_TIMEOUT_MS = 45000

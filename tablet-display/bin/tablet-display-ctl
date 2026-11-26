@@ -141,7 +141,28 @@ set_notice() { update_session '.notice = $m' --arg m "$1"; }
 with_lock() {
   exec 9>"$LOCK"
   flock -w "${LOCK_WAIT:-30}" 9 || { echo "$APP: busy" >&2; return 75; }
+  # Every path that sets session.busy clears it before returning. If we die
+  # first (an error, or the service's timeout sending TERM), clear it on the
+  # way out: a stuck busy disables the panel and stops reconcile. A KILL
+  # skips this; reconcile clears what it leaves behind.
+  trap clear_stale_busy EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   "$@"
+}
+
+# Clears a busy flag left by an operation that died. Only call it while
+# holding the lock: every operation that sets busy holds it, so a busy seen
+# then is stale.
+clear_stale_busy() {
+  local b
+  [[ -f $SESSION ]] || return 0
+  b=$(jq -r '.busy // ""' "$SESSION" 2>/dev/null) || return 0
+  [[ -n $b ]] || return 0
+  log "clearing stale busy ($b)"
+  update_session '.busy = ""'
+  add_error "The last action ($b) was interrupted. If the tablet display looks wrong, turn it off and on again."
 }
 
 # ---------------------------------------------------------------- compositor
@@ -898,13 +919,16 @@ restart_sunshine() { # [tries] [wait_secs] [max_secs]
   local budget=$((SECONDS + max_secs)) try p rc=1 last_rc=1 rem wait_for delay
   p=$(sunshine_port)
   for ((try = 1; try <= tries; try++)); do
-    if ! _restart_sunshine_once; then
+    # A retry needs time to start and bind; with less left, stop here.
+    ((try > 1 && budget - SECONDS < 5)) && break
+    if ! _restart_sunshine_once "$budget"; then
       add_error "Sunshine failed to start (see: $(sunshine_log_hint))"
       return 1
     fi
     rem=$((budget - SECONDS))
     wait_for=$((rem < wait_secs ? rem : wait_secs))
-    ((wait_for < 1)) && wait_for=1
+    # SECONDS counts whole seconds, so a 1s deadline can be a few ms away.
+    ((wait_for < 2)) && wait_for=2
     wait_sunshine_listening "$wait_for" "$p"
     rc=$?
     ((rc == 0)) && return 0
@@ -931,7 +955,8 @@ restart_sunshine() { # [tries] [wait_secs] [max_secs]
   return 1
 }
 
-_restart_sunshine_once() {
+_restart_sunshine_once() { # [deadline in $SECONDS]
+  local until=${1:-}
   stop_sunshine
   if sunshine_has_unit; then
     # The unit gets systemd's user environment, which holds whatever session
@@ -950,8 +975,13 @@ _restart_sunshine_once() {
     # 9>&- : the daemon must not inherit, and so hold forever, our lock.
     user_locale setsid -f sunshine >>"$RUN_DIR/sunshine.log" 2>&1 </dev/null 9>&- || return 1
   fi
-  # Some packaged units sleep a few seconds before starting.
+  # Some packaged units sleep a few seconds before starting. Wait up to 15s,
+  # cut to the caller's deadline but never below 5s.
   local deadline=$((SECONDS + 15))
+  if [[ -n $until ]]; then
+    ((deadline > until)) && deadline=$until
+    ((deadline < SECONDS + 5)) && deadline=$((SECONDS + 5))
+  fi
   while true; do
     sunshine_running && return 0
     ((SECONDS >= deadline)) && return 1
@@ -1389,6 +1419,9 @@ hook_stop() {
 # run on every poll.
 reconcile() {
   local s mode target out
+  # We hold the lock here, so a busy flag is left over from an operation
+  # that was killed.
+  clear_stale_busy
   s=$(session)
   mode=$(jq -r .mode <<<"$s")
 
@@ -1414,7 +1447,6 @@ reconcile() {
     return 0
   fi
 
-  [[ -n $(jq -r .busy <<<"$s") ]] && return 0
   target=$(jq -r .target <<<"$s")
   out=$(jq -r .output <<<"$s")
 
