@@ -811,7 +811,7 @@ conf_has_markers() {
 conf_has_our_hook() {
   [[ -f $SUNSHINE_CONF ]] || return 1
   local val orig filtered
-  while IFS= read -r val; do
+  while IFS= read -r val || [[ -n $val ]]; do
     [[ -n $val ]] || continue
     if filtered=$(strip_our_hook_json "$val") && orig=$(jq -c . <<<"$val" 2>/dev/null); then
       [[ $filtered != "$orig" ]] && return 0
@@ -859,7 +859,7 @@ restore_conf() {
   elif [[ -f $CONF_BACKUP ]]; then
     # Markers were stripped (e.g. saved via Sunshine's Web UI): validate backup
     # first so a corrupt backup never silently drops the user's original keys.
-    if ! jq -e 'type == "object" and ((.other // []) | type == "array") and ((.prep // []) | type == "array")' "$CONF_BACKUP" >/dev/null 2>&1; then
+    if ! jq -e 'type == "object" and (.other | type == "array" and all(type == "string")) and (.prep | type == "array" and all(type == "string"))' "$CONF_BACKUP" >/dev/null 2>&1; then
       log "restore_conf: corrupt backup $CONF_BACKUP; leaving it in place"
       return 1
     fi
@@ -939,7 +939,7 @@ apply_conf() { # output_name
   ours=$(jq -cn --arg c "$HOOK" '[{do: ($c + " hook-start"), undo: ($c + " hook-stop"), elevated: false}]')
   existing=$(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF" | tail -1)
   if [[ -n $existing ]] && filtered=$(strip_our_hook_json "$existing"); then
-    merged=$(jq -cn --argjson f "$filtered" --argjson o "$ours" '$f + $o')
+    merged=$(jq -cn --argjson f "$filtered" --argjson o "$ours" '$f + $o' 2>/dev/null) || merged="$ours"
   else
     merged="$ours"
   fi
@@ -1430,10 +1430,10 @@ case "${1:-}" in
   clear-errors) with_lock update_session '.errors = [] | .notice = ""' ;;
   uninstall)
     ensure_env
-    with_lock teardown
+    with_lock teardown || exit $?
     restored=true
     restore_conf || restored=false
-    if [[ $restored != true ]] || conf_has_our_hook || { [[ -f $SUNSHINE_CONF ]] && grep -qF "$HOOK" "$SUNSHINE_CONF"; }; then
+    if [[ $restored != true ]] || conf_has_our_hook || { [[ -f $SUNSHINE_CONF ]] && grep -qF -- "$HOOK" "$SUNSHINE_CONF"; }; then
       # Keep $HOOK (and $CONF_BACKUP) so Sunshine streams don't abort on a missing prep command.
       rm -rf "$RUN_DIR"
       rm -f "$SETTINGS" "$EDID" "$EDID_ARGS"
