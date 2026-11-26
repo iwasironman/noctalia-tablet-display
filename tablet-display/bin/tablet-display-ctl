@@ -28,12 +28,41 @@
 set -uo pipefail
 
 # Use '.' for decimal formatting/parsing (printf, awk, flock, sleep) even under
-# comma-decimal locales, while preserving UTF-8 character handling.
+# comma-decimal locales, leaving every other locale category as it was.
+# Programs we start for the user (Sunshine, the browser) get the original
+# locale back through user_locale. The original is recorded once, so the
+# detached copies of this script that we spawn pass it on unchanged.
+LOCALE_VARS=(LC_ALL LANG LC_CTYPE LC_COLLATE LC_MESSAGES LC_MONETARY LC_TIME
+  LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION LC_NUMERIC)
+if [[ -z ${TABLET_DISPLAY_USER_LOCALE+x} ]]; then
+  TABLET_DISPLAY_USER_LOCALE=""
+  for _v in "${LOCALE_VARS[@]}"; do
+    if [[ -n ${!_v+x} ]]; then
+      TABLET_DISPLAY_USER_LOCALE+="$_v=${!_v}"$'\n'
+    else
+      TABLET_DISPLAY_USER_LOCALE+="-u$_v"$'\n'
+    fi
+  done
+  export TABLET_DISPLAY_USER_LOCALE
+fi
 if [[ -n ${LC_ALL:-} ]]; then
-  export LANG="$LC_ALL" LC_CTYPE="$LC_ALL"
+  # LC_ALL would override LC_NUMERIC: spread it over every category instead.
+  for _v in "${LOCALE_VARS[@]:1}"; do export "$_v=$LC_ALL"; done
   unset LC_ALL
 fi
+unset _v
 export LC_NUMERIC=C
+
+# Runs a command with the locale the user started us with.
+user_locale() { # cmd...
+  # env takes options only before the first NAME=VALUE, so unsets go first.
+  local unsets=(-u TABLET_DISPLAY_USER_LOCALE) sets=() l
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    if [[ $l == -u* ]]; then unsets+=(-u "${l#-u}"); else sets+=("$l"); fi
+  done <<<"$TABLET_DISPLAY_USER_LOCALE"
+  env "${unsets[@]}" "${sets[@]}" "$@"
+}
 
 APP=noctalia-tablet-display
 CTL=$(realpath "${BASH_SOURCE[0]}")
@@ -821,7 +850,7 @@ _restart_sunshine_once() {
     systemctl --user start "$SUNSHINE_UNIT" || return 1
   else
     # 9>&- : the daemon must not inherit, and so hold forever, our lock.
-    setsid -f sunshine >>"$RUN_DIR/sunshine.log" 2>&1 </dev/null 9>&- || return 1
+    user_locale setsid -f sunshine >>"$RUN_DIR/sunshine.log" 2>&1 </dev/null 9>&- || return 1
   fi
   # Some packaged units sleep a few seconds before starting.
   local deadline=$((SECONDS + 15))
@@ -1424,7 +1453,7 @@ cmd_configure() { # json
 }
 
 open_admin() { # [path]
-  setsid -f xdg-open "https://localhost:47990${1:-}" >/dev/null 2>&1
+  user_locale setsid -f xdg-open "https://localhost:47990${1:-}" >/dev/null 2>&1
 }
 
 cmd_doctor() {
