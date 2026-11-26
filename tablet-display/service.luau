@@ -116,7 +116,6 @@ local function pushConfig(thenPoll)
     -- Defer until the in-flight action releases the control script's lock.
     configNeedsRetry = true
     configRetries = 0
-    if thenPoll then configPendingPoll = true end
     return
   end
   configInFlight = true
@@ -145,6 +144,11 @@ local function pushConfig(thenPoll)
         noctalia.log("configure " .. (timedOut and "timed out" or "busy") .. (configNeedsRetry and "; will retry" or "; giving up"))
       else
         noctalia.log("configure failed: " .. tostring(result and result.stderr))
+        if configJson() ~= json then
+          configRetries = 0
+          pushConfig(shouldPoll)
+          return
+        end
       end
     end
     if shouldPoll then poll(true) end
@@ -207,7 +211,6 @@ local function runAction(command)
       end
     end
     if configNeedsRetry or (not configInFlight and configJson() ~= lastConfig) then
-      configPendingPoll = false
       configRetries = 0
       pushConfig(true)
     else
