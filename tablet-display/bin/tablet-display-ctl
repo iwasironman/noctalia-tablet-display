@@ -254,7 +254,9 @@ profile() {
   settings | jq -c '
     def landscape: if .h > .w then {w: .h, h: .w} else . end;
     def res($s): ($s | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)$")? // null)
-                 | if . then {w: (.w | tonumber), h: (.h | tonumber)} else null end;
+                 | if . and (.w | tonumber) > 0 and (.h | tonumber) > 0 then
+                     {w: (.w | tonumber), h: (.h | tonumber)} | landscape
+                   else null end;
     {
       "galaxy-tab-s9-ultra": {w: 2960, h: 1848, diag: 14.6, name: "Tab S9 Ultra"},
       "galaxy-tab-s9-plus":  {w: 2800, h: 1752, diag: 12.4, name: "Tab S9+"},
@@ -266,7 +268,8 @@ profile() {
       elif .device == "custom" then
         ((res(.customResolution) // {w: 2560, h: 1600}) + {diag: (.customDiagonal // 0), name: "Tablet"})
       else
-        ((if .lastClient then {w: .lastClient.width, h: .lastClient.height} | landscape
+        ((if (.lastClient | type == "object") and (.lastClient.width | type == "number" and . > 0) and (.lastClient.height | type == "number" and . > 0) then
+            {w: .lastClient.width, h: .lastClient.height} | landscape
           else res(.customResolution) // {w: 2560, h: 1600} end)
          + {diag: (.customDiagonal // 0), name: "Tablet"})
       end
@@ -437,26 +440,57 @@ current_scale() {
 }
 
 # The mode the display should have right now, as "W H R".
+# Uses the active Moonlight stream's size/rate while connected, otherwise the
+# selected device profile (which already uses lastClient when device == "auto").
 desired_mode() { # output method
-  local out=$1 method=$2 st p w h fps
-  st=$(settings); p=$(profile)
-  w=$(jq -r '.lastClient.width // empty' <<<"$st"); h=$(jq -r '.lastClient.height // empty' <<<"$st")
-  fps=$(jq -r '.lastClient.fps // 60' <<<"$st")
-  if [[ -z $w ]]; then w=$(jq -r .w <<<"$p"); h=$(jq -r .h <<<"$p"); fi
+  local out=$1 method=$2 st s p cw ch cfps w h fps nw nh
+  st=$(settings); s=$(session); p=$(profile)
+  nw=$(jq -r .w <<<"$p"); nh=$(jq -r .h <<<"$p")
+  read -r cw ch cfps < <(jq -r '
+    if (.client | type == "object") and (.client.width | type == "number" and . > 0) and (.client.height | type == "number" and . > 0) then
+      "\(.client.width | floor) \(.client.height | floor) \(if (.client.fps | type == "number" and . > 0) then (.client.fps | floor) else 0 end)"
+    else "0 0 0" end' <<<"$s")
+  # A client recorded before the running Sunshine started (or with Sunshine
+  # gone) is stale: no stream outlives it, and a crash or a systemd restart
+  # never runs the hook-stop undo command.
+  if ((cw > 0)); then
+    local age since
+    age=$(sunshine_age)
+    since=$(jq -r '.client.since // 0 | floor' <<<"$s" 2>/dev/null)
+    if [[ ! $age =~ ^[0-9]+$ ]] || { [[ $since =~ ^[0-9]+$ ]] && ((since > 0 && since + 2 < $(date +%s) - age)); }; then
+      cw=0; ch=0; cfps=0
+    fi
+  fi
+  if ((cw > 0 && ch > 0)); then
+    w=$cw; h=$ch
+  else
+    w=$nw; h=$nh
+  fi
+  if ((cfps > 0)); then
+    fps=$cfps
+  elif [[ $(jq -r '.device // "auto"' <<<"$st") == auto ]]; then
+    fps=$(jq -r 'if (.lastClient | type == "object") and (.lastClient.fps | type == "number" and . > 0) then (.lastClient.fps | floor) else 60 end' <<<"$st")
+  else
+    fps=60
+  fi
   ((h > w)) && { local t=$w; w=$h; h=$t; }
   if [[ $method == virtual ]]; then
     # Twice the stream rate: Sunshine's capture waits for the next refresh,
-    # and at 1x the wait costs frames. Capped at 240.
-    echo "$w $h $((fps * 2 > 240 ? 240 : fps * 2))"
+    # and at 1x the wait costs frames. Clamped to 60..240.
+    local rate=$((fps * 2))
+    ((rate < 60)) && rate=60
+    ((rate > 240)) && rate=240
+    echo "$w $h $rate"
     return
   fi
-  # Port: pick from the EDID's modes. The client's size if present, else the
-  # native size; the fastest refresh at that size.
-  monitors_json | jq -r --arg n "$out" --argjson w "$w" --argjson h "$h" --argjson nw "$(jq .w <<<"$p")" --argjson nh "$(jq .h <<<"$p")" '
-    (.[] | select(.name == $n) | .modes) as $m
-    | (($m | map(select(.w == $w and .h == $h))) as $x | if ($x | length) > 0 then $x
-       else ($m | map(select(.w == $nw and .h == $nh))) end)
-    | max_by(.r) // empty | "\(.w) \(.h) \(.r)"'
+  # Port: pick from the EDID's modes. The active client's size if present, else
+  # the native profile size, else any mode; the fastest refresh at that size.
+  monitors_json | jq -r --arg n "$out" --argjson w "$w" --argjson h "$h" --argjson nw "$nw" --argjson nh "$nh" '
+    (.[] | select(.name == $n) | .modes // []) as $m
+    | (($m | map(select(.w == $w and .h == $h)))
+       | if length > 0 then . else ($m | map(select(.w == $nw and .h == $nh))) end
+       | if length > 0 then . else $m end)
+    | max_by([.w * .h, .r]) // empty | "\(.w) \(.h) \(.r)"'
 }
 
 # Position for a display of logical size lw x lh next to the reference
@@ -653,6 +687,9 @@ sunshine_has_unit() {
 stop_sunshine() {
   if sunshine_has_unit; then systemctl --user stop "$SUNSHINE_UNIT" 2>/dev/null; fi
   pkill -u "$(id -u)" -x sunshine 2>/dev/null
+  # Any stream ends with Sunshine, and a killed Sunshine may never run the
+  # hook-stop undo command; desired_mode must not keep using that client.
+  [[ -f $SESSION ]] && update_session '.client = null'
   for _ in {1..30}; do sunshine_running || return 0; sleep 0.1; done
   pkill -9 -u "$(id -u)" -x sunshine 2>/dev/null
 }
@@ -1110,7 +1147,7 @@ do_start() { # mode [target]
   fi
 
   COMP=$(detect_compositor)
-  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", listenRetried: false, compositor: $c, env: $e}' \
+  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
   if [[ $mode == extend ]]; then
@@ -1160,8 +1197,8 @@ do_start() { # mode [target]
 hook_start() {
   local w="${SUNSHINE_CLIENT_WIDTH:-}" h="${SUNSHINE_CLIENT_HEIGHT:-}" fps="${SUNSHINE_CLIENT_FPS:-}" s
   log "hook-start ${w}x${h}@${fps}"
-  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] || return 0
-  [[ $fps =~ ^[0-9]+$ ]] || fps=60
+  [[ $w =~ ^[0-9]+$ && $h =~ ^[0-9]+$ ]] && ((w > 0 && h > 0)) || return 0
+  [[ $fps =~ ^[0-9]+$ ]] && ((fps > 0)) || fps=60
   update_settings '.lastClient = {width: $w, height: $h, fps: $f}' --argjson w "$w" --argjson h "$h" --argjson f "$fps"
   update_session '.client = {width: $w, height: $h, fps: $f, since: now | floor}' --argjson w "$w" --argjson h "$h" --argjson f "$fps"
   s=$(session)
