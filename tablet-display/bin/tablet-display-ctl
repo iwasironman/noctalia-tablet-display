@@ -393,14 +393,18 @@ free_ports() {
 }
 
 port_candidates() {
-  local want working
+  local want working free
   want=$(setting port)
   if [[ -n $want && $want != auto ]]; then echo "$want"; return; fi
   working=$(setting workingPort)
-  local free
   free=$(free_ports)
-  [[ -n $working ]] && grep -qx "$working" <<<"$free" && echo "$working"
-  grep -vx "${working:-//}" <<<"$free"
+  [[ -n $free ]] || return 0
+  if [[ -n $working ]] && grep -qxF -- "$working" <<<"$free"; then
+    echo "$working"
+    grep -vxF -- "$working" <<<"$free" || true
+  else
+    printf '%s\n' "$free"
+  fi
 }
 
 wait_for_monitor() { # name seconds
@@ -415,17 +419,18 @@ wait_for_monitor() { # name seconds
 # Forces a port on and waits for the compositor to show it. Prints the output
 # name. Tries up to three candidates when the port is "auto".
 port_on() {
-  local c out tries=0
+  local c out tries=0 timed_out=() err
   helper_installed || { add_error "The port helper is not installed. Open the panel and choose Install helper."; return 1; }
   build_edid || return 1
-  for c in $(port_candidates); do
+  while IFS= read -r c; do
+    [[ -n $c ]] || continue
     ((tries++ < 3)) || break
     out=${c#*-}
     log "port: trying $c"
-    local err
     if ! err=$(pkexec "$HELPER" on "$c" <"$EDID" 2>&1 >>"$LOG"); then
       log "port: $err"
-      add_error "${err#port-helper: }"
+      local msg=${err#port-helper: }
+      add_error "${msg:-Could not enable $c (port helper failed)}"
       continue
     fi
     if wait_for_monitor "$out" 6; then
@@ -435,9 +440,16 @@ port_on() {
       return 0
     fi
     log "port: $c did not appear in the compositor"
+    timed_out+=("$c")
     pkexec "$HELPER" off "$c" >>"$LOG" 2>&1
-  done
-  ((tries)) || add_error "No free display port found (all are in use)"
+  done < <(port_candidates)
+  if ((tries == 0)); then
+    add_error "No free display port found (all are in use)"
+  elif ((${#timed_out[@]})); then
+    local list
+    list=$(printf '%s, ' "${timed_out[@]}")
+    add_error "Forced display port (${list%, }) did not appear in ${COMP:-the compositor} (see $LOG)"
+  fi
   return 1
 }
 
