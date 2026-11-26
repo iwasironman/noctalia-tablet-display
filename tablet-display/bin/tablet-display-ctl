@@ -760,11 +760,16 @@ stop_sunshine() {
 }
 
 # Sunshine's HTTP port (Moonlight's first contact). `port` in sunshine.conf
-# moves the whole range; 47989 is the default (RTSP is port + 21 = 48010).
+# moves the whole range; 47989 is the default (Web UI is port + 1 = 47990,
+# RTSP is port + 21 = 48010).
 sunshine_port() {
   local p
-  p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
-  echo "${p:-47989}"
+  p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]{1,5})[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
+  if [[ -n $p ]] && ((10#$p >= 6 && 10#$p <= 65514)); then
+    echo "$((10#$p))"
+  else
+    echo 47989
+  fi
 }
 
 # Heuristic check: verify Sunshine's TCP HTTP (port) and RTSP (port + 21)
@@ -1497,7 +1502,8 @@ cmd_configure() { # json
 }
 
 open_admin() { # [path]
-  user_locale setsid -f xdg-open "https://localhost:47990${1:-}" >/dev/null 2>&1
+  local port=$(($(sunshine_port) + 1))
+  user_locale setsid -f xdg-open "https://localhost:${port}${1:-}" >/dev/null 2>&1 </dev/null
 }
 
 cmd_doctor() {
@@ -1515,14 +1521,18 @@ cmd_doctor() {
   echo "free ports:       $(free_ports | paste -sd' ')"
   echo "profile:          $(profile)"
   echo "edid:             $([[ -f $EDID ]] && cat "$EDID_ARGS" || echo 'not built yet')"
-  if command -v ufw >/dev/null; then echo "firewall:         ufw is installed; Sunshine needs TCP 47984,47989,47990,48010 and UDP 47998-48000 open"; fi
+  local p tcp_ports udp_ports
+  p=$(sunshine_port)
+  tcp_ports="$((p - 5)),$p,$((p + 1)),$((p + 21))"
+  udp_ports="$((p + 9)):$((p + 11))"
+  if command -v ufw >/dev/null; then echo "firewall:         ufw is installed; Sunshine needs TCP $tcp_ports and UDP ${udp_ports/:/-} open"; fi
   local links
   links=$(usb_links)
   if [[ $(jq length <<<"$links") -gt 0 ]]; then
     jq -r '.[] | "usb link:         \(.iface) (\(.driver), \(.speed) Mbit/s) at \(.ip)\(if .defaultRoute then ", carrying the default route" else "" end)"' <<<"$links"
     if command -v ufw >/dev/null; then
       echo "                  If Moonlight can't connect over USB, allow Sunshine on the link:"
-      jq -r '.[] | "                    sudo ufw allow in on \(.iface) proto tcp to any port 47984,47989,47990,48010\n                    sudo ufw allow in on \(.iface) proto udp to any port 47998:48000"' <<<"$links"
+      jq -r --arg tcp "$tcp_ports" --arg udp "$udp_ports" '.[] | "                    sudo ufw allow in on \(.iface) proto tcp to any port \($tcp)\n                    sudo ufw allow in on \(.iface) proto udp to any port \($udp)"' <<<"$links"
     fi
   else
     echo "usb link:         none (turn on USB tethering on the tablet to stream over the cable)"
