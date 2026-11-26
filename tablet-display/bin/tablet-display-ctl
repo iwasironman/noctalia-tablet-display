@@ -549,10 +549,14 @@ auto_scale() { # w h diag
     s = int(s * 4 + 0.5) / 4; if (s < 1) s = 1; if (s > 3) s = 3; print s }'
 }
 
+valid_scale() {
+  [[ $1 =~ ^[0-9](\.[0-9]{1,3})?$ ]] && awk -v s="$1" 'BEGIN { exit !(s >= 0.5 && s <= 5) }'
+}
+
 current_scale() {
   local s p
   s=$(setting scale)
-  if [[ $s =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$s"; return; fi
+  if valid_scale "$s"; then echo "$s"; return; fi
   p=$(profile)
   auto_scale "$(jq -r .w <<<"$p")" "$(jq -r .h <<<"$p")" "$(jq -r .diag <<<"$p")"
 }
@@ -1516,12 +1520,14 @@ print_state() {
       addresses: ($addrs | split(" ") | map(select(. != "")) | map(select(. as $a | $usb | map(.ip) | index($a) | not)))
     }
     | .hint = (
-        if .client and .monitor then
+        if (.client | type == "object") and (.monitor | type == "object")
+           and (.client.width | type == "number" and . > 0) and (.client.height | type == "number" and . > 0)
+           and (.monitor.width | type == "number" and . > 0) and (.monitor.height | type == "number" and . > 0) then
           (.client.width / .client.height) as $cr | (.monitor.width / .monitor.height) as $mr
           | "\(.client.width)×\(.client.height)" as $c | "\(.monitor.width)×\(.monitor.height)" as $m
           | if (($cr - $mr) | fabs) / $mr > 0.02 then
               "Moonlight is streaming \($c), a different shape from this \($m) display, so you will see black bars. Set Moonlight to Native resolution and reconnect."
-            elif .client.width < 1600 then
+            elif .client.width < 1600 and .client.width < .monitor.width then
               "Moonlight is streaming only \($c), so it will look soft. Set Moonlight to Native resolution and reconnect."
             else "" end
         else "" end)'
@@ -1542,7 +1548,7 @@ cmd_set() { # key value
   local key=$1 value=$2 s mode
   case $key in
     position) [[ $value =~ ^(left|right|above|below)$ ]] || return 64 ;;
-    scale) [[ $value == auto || $value =~ ^[0-9](\.[0-9]{1,3})?$ ]] || return 64 ;;
+    scale) [[ $value == auto ]] || valid_scale "$value" || return 64 ;;
     *) echo "unknown setting: $key" >&2; return 64 ;;
   esac
   update_settings '.[$k] = $v' --arg k "$key" --arg v "$value"
