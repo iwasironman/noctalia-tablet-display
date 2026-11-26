@@ -401,12 +401,24 @@ orphan_ports() {
 
 # Turns orphans off. The helper refuses any connector it didn't force, so a
 # real monitor is never touched. Returns 0 if it released something.
-release_orphans() {
-  local c released=1
+# Reconcile runs on every state poll, so a port that failed to release is
+# remembered and skipped there (no pkexec and no repeated error every few
+# seconds); Extend and Off pass --retry to try it again.
+release_orphans() { # [--retry]
+  local c released=1 failed
   helper_installed || return 1
+  failed=$(session | jq -c '.orphanFailed // []')
   for c in $(orphan_ports); do
+    if [[ ${1:-} != --retry ]] && jq -e --arg c "$c" 'index($c)' <<<"$failed" >/dev/null; then
+      continue
+    fi
     log "port: releasing $c, left on by an earlier session"
-    port_off "$c" && released=0
+    if port_off "$c"; then
+      released=0
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c])' --arg c "$c"
+    else
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c] + [$c])' --arg c "$c"
+    fi
   done
   return $released
 }
@@ -853,7 +865,7 @@ teardown() { # [notice]
   update_session '. + {mode: "off", method: "", output: "", port: "", target: "", client: null, applied: "", busy: "", notice: $n}' \
     --arg n "${1:-}"
   log "off"
-  release_orphans && { sleep 0.3; rebase_layout; }
+  release_orphans --retry && { sleep 0.3; rebase_layout; }
 }
 
 do_start() { # mode [target]
@@ -873,7 +885,7 @@ do_start() { # mode [target]
   update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
-  release_orphans && sleep 0.3
+  release_orphans --retry && sleep 0.3
   if [[ $mode == extend ]]; then
     # Where the real monitors are before the tablet appears; placement pins
     # them here (see apply_display).
