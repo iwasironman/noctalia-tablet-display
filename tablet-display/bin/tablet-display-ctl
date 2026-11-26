@@ -27,6 +27,14 @@
 
 set -uo pipefail
 
+# Use '.' for decimal formatting/parsing (printf, awk, flock, sleep) even under
+# comma-decimal locales, while preserving UTF-8 character handling.
+if [[ -n ${LC_ALL:-} ]]; then
+  export LANG="$LC_ALL" LC_CTYPE="$LC_ALL"
+  unset LC_ALL
+fi
+export LC_NUMERIC=C
+
 APP=noctalia-tablet-display
 CTL=$(realpath "${BASH_SOURCE[0]}")
 BIN_DIR=$(dirname "$CTL")
