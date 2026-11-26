@@ -39,6 +39,24 @@ function M.isActive(s)
   return s.mode == "extend" or s.mode == "mirror"
 end
 
+-- Extend needs the port helper here and it isn't installed: the panel offers
+-- to install it, so quick toggles open the panel instead of failing.
+function M.extendBlocked(s)
+  local h = s.helper
+  return type(h) == "table" and h.needed == true and h.installed == false
+end
+
+-- The bar widget's right-click and the control-center tile: Extend on/off.
+function M.quickToggle(s)
+  if M.isActive(s) then
+    M.send("off")
+  elseif M.extendBlocked(s) then
+    noctalia.togglePanel(M.PANEL_ID)
+  else
+    M.send("extend")
+  end
+end
+
 local function hz(r)
   return tostring(math.floor((tonumber(r) or 0) + 0.5))
 end

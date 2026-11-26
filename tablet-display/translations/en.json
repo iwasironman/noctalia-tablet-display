@@ -45,7 +45,7 @@
     },
     "usb_keep_internet": {
       "label": "Keep internet off the USB cable",
-      "description": "With USB tethering on, the tablet offers the computer an internet connection and would take over its traffic. This keeps your internet on Wi-Fi or Ethernet, for the current connection only (nothing is saved, and it never applies when the cable is your only connection). Uses nmcli."
+      "description": "With USB tethering on, the tablet offers the computer an internet connection and would take over its traffic. This keeps your internet on Wi-Fi or Ethernet, only while the tablet display is on and for the current connection only (nothing is saved, and it never applies when the cable is your only connection). Uses nmcli."
     }
   },
   "status": {
@@ -110,6 +110,7 @@
     "press_enter": "Press Enter to close",
     "installing_helper": "Installing the Tablet Display port helper (needs sudo).",
     "busy": "Still busy: {action}",
-    "timed_out": "'{action}' timed out"
+    "timed_out": "'{action}' timed out",
+    "failed": "'{action}' failed; open the panel for details"
   }
 }

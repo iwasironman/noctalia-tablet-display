@@ -107,7 +107,9 @@ noctalia msg panel-toggle iwasironman/tablet-display:panel
    panel, sign in with Sunshine's username and password, and enter the PIN.
 4. In Moonlight, set the resolution to **Native** and start **Desktop**.
 5. Use the arrows under **Placement** to put the tablet left, above, below or
-   right of your screen, and **Scale** to size its contents.
+   right of your screen, and **Scale** to size its contents. With several
+   monitors, the tablet goes beside the one that had focus when you chose
+   **Extend**, past any other monitor on that side.
 6. Choose **Off** when you're done. Sunshine stops.
 
 Right-clicking the bar widget, or clicking the control-center tile, turns
@@ -136,7 +138,7 @@ Moonlight work the same way; only the address Moonlight connects to changes.
    the same name.
 
 With tethering on, the tablet also offers the computer an internet connection,
-and NetworkManager prefers it over Wi-Fi. The plugin takes the default route off
+and NetworkManager prefers it over Wi-Fi. While the tablet display is on, the plugin takes the default route off
 the USB link (see the `usb_keep_internet` setting), so your internet stays on
 Wi-Fi or Ethernet. **Diagnostics** opens a terminal with a report for bug
 reports.
@@ -152,7 +154,7 @@ Under **Settings → Plugins → Tablet Display**. Advanced settings are behind
 | `custom_resolution` | `string` | `2560x1600` | For *Custom*, and for *Auto* before Moonlight first connects: `WIDTHxHEIGHT` in landscape. |
 | `custom_diagonal` | `double` | `0` | Screen diagonal in inches, used to pick the automatic scale. `0` means unknown. |
 | `audio` | `bool` | `false` | Play the computer's sound on the tablet while streaming. |
-| `usb_keep_internet` | `bool` | `true` | In USB mode, keep the computer's internet traffic off the USB cable. Applies `nmcli device modify <iface> ipv4.never-default yes ipv6.never-default yes` to the current connection only (nothing is saved), and only when another internet connection exists. |
+| `usb_keep_internet` | `bool` | `true` | In USB mode, keep the computer's internet traffic off the USB cable. Applies `nmcli device modify <iface> ipv4.never-default yes ipv6.never-default yes` to the current connection only (nothing is saved), only while the tablet display is on, and only when another internet connection exists. |
 | `keep_sunshine` | `bool` | `false` | Advanced. Leave Sunshine running after **Off**, as it was before. Sunshine then follows your own Sunshine settings, which may stream your main screen. |
 | `refresh_rates` | `string` | `60,90,120` | Advanced. Refresh rates the display offers, comma-separated; it uses the fastest. 2960×1848 at 120 Hz needs about 17 Gbit/s, which the GPU's port must carry. |
 | `method` | `select` | `auto` | Advanced. *Virtual output*, *Unused display port*, or *Automatic* (virtual where the compositor supports it, otherwise the port). |

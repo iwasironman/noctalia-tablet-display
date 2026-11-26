@@ -31,7 +31,7 @@ end)
 render()
 
 function onClick()
-  common.send(common.isActive(snapshot) and "off" or "extend")
+  common.quickToggle(snapshot)
 end
 
 function onRightClick()

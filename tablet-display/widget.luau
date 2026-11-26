@@ -49,5 +49,5 @@ function onRightClick()
   if (snapshot.pending or "") ~= "" or snapshot.available == false or snapshot.installed == false then
     return
   end
-  common.send(common.isActive(snapshot) and "off" or "extend")
+  common.quickToggle(snapshot)
 end
