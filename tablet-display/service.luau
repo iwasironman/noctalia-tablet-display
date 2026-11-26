@@ -219,9 +219,10 @@ local function runAction(command)
       noctalia.notifyError(tr("title"), tr("service.timed_out", { action = action }))
     elseif result.exitCode ~= 0 and result.exitCode ~= 75 then
       local msg = noctalia.string.trim(result.stderr or "")
-      if msg ~= "" then
-        noctalia.notifyError(tr("title"), msg)
+      if msg == "" then
+        msg = tr("service.failed", { action = action })
       end
+      noctalia.notifyError(tr("title"), msg)
     end
     if configNeedsRetry or (not configInFlight and configJson() ~= lastConfig) then
       configRetries = 0

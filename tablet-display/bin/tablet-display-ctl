@@ -106,7 +106,7 @@ DEFAULT_SETTINGS='{
   "keepSunshine": false, "usbKeepInternet": true,
   "workingPort": null, "lastClient": null
 }'
-EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"listenRetried":false,"sunshineRestartPending":false,"repairSpawnedAt":0,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
+EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","reference":"","compositor":"","env":{},"sunshineWasRunning":false,"listenRetried":false,"sunshineRestartPending":false,"repairSpawnedAt":0,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
 
 mkdir -p "$STATE_DIR" "$RUN_DIR"
 
@@ -639,27 +639,53 @@ desired_mode() { # output method
     | max_by([.w * .h, .r]) // empty | "\(.w) \(.h) \(.r)"'
 }
 
-# Position for a display of logical size lw x lh next to the reference
-# monitor, for compositors that take coordinates.
+# The monitor the tablet is placed against: the one remembered when Extend
+# started, so placement doesn't follow keyboard focus to another monitor on
+# every re-apply; the focused one if that is gone.
+placement_reference() { # exclude
+  local r
+  r=$(session | jq -r '.reference // empty')
+  if [[ -n $r && $r != "${1:-}" ]] && monitor_exists "$r"; then
+    echo "$r"
+    return
+  fi
+  reference_monitor "${1:-}" | jq -r '.name // empty'
+}
+
+# Position for a display of logical size lw x lh beside the reference
+# monitor, for compositors that take coordinates. It goes past every monitor
+# in the reference's row (left/right) or column (above/below), so with several
+# monitors it never lands on top of another one.
 placement() { # lw lh exclude
   local ref pos
-  ref=$(reference_monitor "$3")
+  ref=$(placement_reference "$3")
   [[ -n $ref ]] || { echo "0 0"; return; }
   pos=$(setting position)
-  # The reference's size comes from its pixel mode, rounded up: compositors
-  # report logical sizes rounded down (1600 / 1.5 = 1066.67 shows as 1066),
-  # and niri moves an output that overlaps another by even a fraction. Swap
-  # pw/ph when the reference monitor is rotated 90° or 270°.
-  jq -r --arg p "$pos" --argjson lw "$1" --argjson lh "$2" '
-    (if (.scale | type == "number" and . > 0) then .scale else 1 end) as $s
-    | (if .rotated then .ph else .pw end) as $ew
-    | (if .rotated then .pw else .ph end) as $eh
-    | (if $ew > 0 then (($ew / $s) | ceil) else .lw end) as $rw
-    | (if $eh > 0 then (($eh / $s) | ceil) else .lh end) as $rh
-    | if $p == "left" then "\(.x - $lw) \(.y)"
-      elif $p == "above" then "\(.x) \(.y - $lh)"
-      elif $p == "below" then "\(.x) \(.y + $rh)"
-      else "\(.x + $rw) \(.y)" end' <<<"$ref"
+  # Sizes come from the pixel mode, rounded up: compositors report logical
+  # sizes rounded down (1600 / 1.5 = 1066.67 shows as 1066), and niri moves an
+  # output that overlaps another by even a fraction. pw/ph are swapped for
+  # monitors rotated 90° or 270°.
+  monitors_json | jq -r --arg p "$pos" --arg x "$3" --arg r "$ref" --argjson lw "$1" --argjson lh "$2" '
+    def box:
+      (if (.scale | type == "number" and . > 0) then .scale else 1 end) as $s
+      | (if .rotated then .ph else .pw end) as $ew
+      | (if .rotated then .pw else .ph end) as $eh
+      | {name, x, y,
+         w: (if $ew > 0 then (($ew / $s) | ceil) else .lw end),
+         h: (if $eh > 0 then (($eh / $s) | ceil) else .lh end)};
+    (map(select(.enabled and .name != $x) | box)) as $all
+    | ($all | map(select(.name == $r)) | .[0]) as $ref
+    | if $ref == null then "0 0"
+      elif $p == "left" or $p == "right" then
+        # Monitors sharing rows with the tablet, which is $lh tall at $ref.y.
+        ($all | map(select(.y < $ref.y + $lh and .y + .h > $ref.y))) as $row
+        | if $p == "left" then "\(($row | map(.x) | min) - $lw) \($ref.y)"
+          else "\($row | map(.x + .w) | max) \($ref.y)" end
+      else
+        ($all | map(select(.x < $ref.x + $lw and .x + .w > $ref.x))) as $col
+        | if $p == "above" then "\($ref.x) \(($col | map(.y) | min) - $lh)"
+          else "\($ref.x) \($col | map(.y + .h) | max)" end
+      end'
 }
 
 # Final positions for every monitor, as "name x y" lines (the tablet last).
@@ -1307,10 +1333,13 @@ teardown() { # [notice] [--no-restart]
   if [[ $no_restart != --no-restart && $mode != off && $was == true && $(setting keepSunshine) == true ]]; then
     restart_sunshine 1 7 15 || true
   fi
-  update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
+  update_session '. + {mode: "off", method: "", output: "", port: "", target: "", reference: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
     --arg n "$notice"
   log "off"
-  release_orphans --retry && { sleep 0.3; rebase_layout; }
+  # release_orphans returns 1 when there was nothing to release, the usual
+  # case; that must not make `off` (and `uninstall`) fail.
+  if release_orphans --retry; then sleep 0.3; rebase_layout; fi
+  return 0
 }
 
 do_start() { # mode [target]
@@ -1321,13 +1350,16 @@ do_start() { # mode [target]
     was=$(session | jq -r .sunshineWasRunning)
     # Tear down with the compositor that owns the current display; a
     # subshell so the new session below keeps the caller's own environment.
-    ( ensure_env; teardown )
+    # --no-restart: Sunshine is restarted with the new config below, and
+    # restarting it in between (keep_sunshine) would briefly stream with the
+    # user's own config, which may be the main screen.
+    ( ensure_env; teardown "" --no-restart )
   else
     sunshine_running && was=true || was=false
   fi
 
   COMP=$(detect_compositor)
-  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, sunshineRestartPending: false, compositor: $c, env: $e}' \
+  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", reference: "", client: null, listenRetried: false, sunshineRestartPending: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
   if [[ $COMP == sway || $COMP == mango || $COMP == wlr ]] && ! command -v wlr-randr >/dev/null 2>&1; then
@@ -1341,6 +1373,7 @@ do_start() { # mode [target]
     # Where the real monitors are before the tablet appears; placement pins
     # them here (see apply_display).
     update_session '.home = $h' --argjson h "$(monitors_json | jq -c 'map(select(.enabled) | {(.name): {x, y}}) | add // {}')"
+    update_session '.reference = $r' --arg r "$(reference_monitor | jq -r '.name // empty')"
     method=$(choose_method)
     if [[ $method == virtual ]]; then
       local w h r
@@ -1613,7 +1646,9 @@ print_state() {
 
 cmd_state() {
   ensure_env
-  usb_keep_internet
+  # Only while the tablet display is on: the drivers it looks for also carry
+  # phones' USB tethering, which may be the internet connection the user wants.
+  [[ $(session | jq -r .mode) != off ]] && usb_keep_internet
   if [[ ${1:-} != --no-reconcile ]]; then
     exec 9>"$LOCK"
     if flock -w 0.3 9; then reconcile; fi
@@ -1741,10 +1776,18 @@ USAGE
   exit 64
 }
 
+# Errors are recorded in the session for the panel. When an action fails, also
+# print the newest one to stderr, so the service can show it as a notification
+# when the action came from the bar widget, the control-center tile or IPC.
+report_failure() { # rc
+  if (($1 != 0 && $1 != 75)); then session | jq -r '.errors[-1] // empty' >&2; fi
+  return "$1"
+}
+
 case "${1:-}" in
   state) cmd_state "${2:-}" ;;
-  extend) with_lock do_start extend ;;
-  mirror) with_lock do_start mirror "${2:-}" ;;
+  extend) with_lock do_start extend; report_failure $? ;;
+  mirror) with_lock do_start mirror "${2:-}"; report_failure $? ;;
   off) ensure_env; with_lock teardown ;;
   set) [[ $# -eq 3 ]] || usage; with_lock cmd_set "$2" "$3" ;;
   # A short lock wait, so a held lock reports "busy" (75) well inside
