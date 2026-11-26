@@ -65,7 +65,7 @@ DEFAULT_SETTINGS='{
   "keepSunshine": false, "usbKeepInternet": true,
   "workingPort": null, "lastClient": null
 }'
-EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
+EMPTY_SESSION='{"mode":"off","method":"","output":"","port":"","target":"","compositor":"","env":{},"sunshineWasRunning":false,"listenRetried":false,"client":null,"applied":"","mapped":[],"errors":[],"notice":"","busy":""}'
 
 mkdir -p "$STATE_DIR" "$RUN_DIR"
 
@@ -630,7 +630,8 @@ unmap_input_devices() {
 # ---------------------------------------------------------------- sunshine
 
 sunshine_installed() { command -v sunshine >/dev/null 2>&1; }
-sunshine_running() { pgrep -x sunshine >/dev/null 2>&1; }
+sunshine_pid() { pgrep -u "$(id -u)" -x sunshine | head -1; }
+sunshine_running() { pgrep -u "$(id -u)" -x sunshine >/dev/null 2>&1; }
 # The package ships app-dev.lizardbyte.app.Sunshine.service, with
 # "sunshine.service" only as an Alias= that exists once the unit is enabled.
 SUNSHINE_UNIT=""
@@ -646,9 +647,9 @@ sunshine_has_unit() {
 
 stop_sunshine() {
   if sunshine_has_unit; then systemctl --user stop "$SUNSHINE_UNIT" 2>/dev/null; fi
-  pkill -x sunshine 2>/dev/null
+  pkill -u "$(id -u)" -x sunshine 2>/dev/null
   for _ in {1..30}; do sunshine_running || return 0; sleep 0.1; done
-  pkill -9 -x sunshine 2>/dev/null
+  pkill -9 -u "$(id -u)" -x sunshine 2>/dev/null
 }
 
 # Sunshine's HTTP port (Moonlight's first contact). `port` in sunshine.conf
@@ -658,18 +659,33 @@ sunshine_port() {
   p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
   echo "${p:-47989}"
 }
-sunshine_listening() { # [port]
+
+# Heuristic check: verify Sunshine's TCP HTTP (port) and RTSP (port + 21)
+# listeners are up (HTTPS port-5 and UDP stream ports are not checked).
+# When ss reports process ownership (`users:(...)`), reject sockets owned by a
+# different PID (e.g. a lingering child process). Packaged Sunshine binaries
+# with file capabilities (cap_sys_admin) hide /proc/<pid>/fd from unprivileged
+# ss, so lines without `users:(` are still accepted.
+sunshine_listening() { # [port] [pid]
   command -v ss >/dev/null || return 0
-  local p=${1:-$(sunshine_port)} rtsp out
+  local p=${1:-$(sunshine_port)} pid=${2:-$(sunshine_pid)} rtsp out line
+  local have_http=0 have_rtsp=0
   rtsp=$((p + 21))
-  out=$(ss -tlnH "( sport = :$p or sport = :$rtsp )" 2>/dev/null) || return 0
-  [[ $out =~ :${p}[[:space:]] && $out =~ :${rtsp}[[:space:]] ]]
+  out=$(ss -tlnpH "( sport = :$p or sport = :$rtsp )" 2>/dev/null) || return 0
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ -n $pid && $line == *"users:("* && ! $line =~ pid=${pid}[^0-9] ]]; then
+      continue
+    fi
+    [[ $line =~ :${p}[[:space:]] ]] && have_http=1
+    [[ $line =~ :${rtsp}[[:space:]] ]] && have_rtsp=1
+  done <<<"$out"
+  ((have_http && have_rtsp))
 }
 
 # Seconds since the Sunshine process started, or nothing if it isn't running.
-sunshine_age() {
-  local pid
-  pid=$(pgrep -u "$(id -u)" -x sunshine | head -1)
+sunshine_age() { # [pid]
+  local pid=${1:-$(sunshine_pid)}
   [[ -n $pid ]] || return 0
   ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' '
 }
@@ -686,29 +702,55 @@ sunshine_log_hint() {
 # enough: if a port is still held (for example by the previous instance's
 # stream), Sunshine logs "Couldn't bind ... Address already in use", keeps
 # only its web UI, and Moonlight can't connect.
+# Returns 0 if listening, 1 on timeout while still running, 2 if process exited.
 wait_sunshine_listening() { # seconds [port]
-  local i p=${2:-$(sunshine_port)}
-  for ((i = 0; i < $1 * 10; i++)); do
-    sunshine_listening "$p" && return 0
-    sunshine_running || return 1
+  local deadline=$((SECONDS + $1)) p=${2:-$(sunshine_port)} pid
+  while true; do
+    pid=$(sunshine_pid)
+    [[ -n $pid ]] || return 2
+    sunshine_listening "$p" "$pid" && return 0
+    ((SECONDS >= deadline)) && return 1
     sleep 0.1
   done
-  return 1
 }
 
-restart_sunshine() { # [tries] [wait_secs]
-  local tries=${1:-3} wait_secs=${2:-10} try p
+# Note: if all retries fail to bind, the last Sunshine instance is left running
+# (it may still finish binding later), while an error is reported in session state.
+restart_sunshine() { # [tries] [wait_secs] [max_secs]
+  local tries=${1:-3} wait_secs=${2:-7} max_secs=${3:-40}
+  local budget=$((SECONDS + max_secs)) try p rc=1 last_rc=1 rem wait_for delay
   p=$(sunshine_port)
   for ((try = 1; try <= tries; try++)); do
     if ! _restart_sunshine_once; then
       add_error "Sunshine failed to start (see: $(sunshine_log_hint))"
       return 1
     fi
-    wait_sunshine_listening "$wait_secs" "$p" && return 0
-    log "sunshine: running but not listening on $p/$((p + 21)) (try $try/$tries); restarting"
-    ((try < tries)) && sleep $((try * 2))
+    rem=$((budget - SECONDS))
+    wait_for=$((rem < wait_secs ? rem : wait_secs))
+    ((wait_for < 1)) && wait_for=1
+    wait_sunshine_listening "$wait_for" "$p"
+    rc=$?
+    ((rc == 0)) && return 0
+    last_rc=$rc
+    if ((rc == 2)); then
+      log "sunshine: exited before binding $p/$((p + 21)) (try $try/$tries)"
+    else
+      log "sunshine: running but not listening on $p/$((p + 21)) (try $try/$tries)"
+      if command -v ss >/dev/null; then
+        log "sunshine: listeners: $(ss -tlnpH "( sport = :$p or sport = :$((p + 21)) )" 2>/dev/null | tr '\n' ';' || true)"
+      fi
+    fi
+    if ((try < tries)); then
+      delay=$((try * 2))
+      ((SECONDS + delay >= budget)) && break
+      sleep "$delay"
+    fi
   done
-  add_error "Sunshine started but isn't accepting Moonlight connections (port $p or $((p + 21)) may be in use; see: $(sunshine_log_hint))"
+  if ((last_rc == 2)); then
+    add_error "Sunshine exited before starting (see: $(sunshine_log_hint))"
+  else
+    add_error "Sunshine started but isn't accepting Moonlight connections (port $p or $((p + 21)) may be in use; see: $(sunshine_log_hint))"
+  fi
   return 1
 }
 
@@ -732,8 +774,12 @@ _restart_sunshine_once() {
     setsid -f sunshine >>"$RUN_DIR/sunshine.log" 2>&1 </dev/null 9>&- || return 1
   fi
   # Some packaged units sleep a few seconds before starting.
-  for _ in {1..150}; do sunshine_running && return 0; sleep 0.1; done
-  return 1
+  local deadline=$((SECONDS + 15))
+  while true; do
+    sunshine_running && return 0
+    ((SECONDS >= deadline)) && return 1
+    sleep 0.1
+  done
 }
 
 conf_has_block() { [[ -f $SUNSHINE_CONF ]] && grep -qF "$MARK_BEGIN" "$SUNSHINE_CONF"; }
@@ -879,9 +925,9 @@ teardown() { # [notice]
   # Off means nothing is streamed: leave Sunshine stopped, unless the user
   # asked to keep it running (as it was before we started).
   if [[ $mode != off && $was == true && $(setting keepSunshine) == true ]]; then
-    restart_sunshine || add_error "Sunshine did not come back after restoring its config"
+    restart_sunshine 1 7 15 || true
   fi
-  update_session '. + {mode: "off", method: "", output: "", port: "", target: "", client: null, applied: "", busy: "", notice: $n}' \
+  update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
     --arg n "${1:-}"
   log "off"
 }
@@ -900,7 +946,7 @@ do_start() { # mode [target]
   fi
 
   COMP=$(detect_compositor)
-  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", compositor: $c, env: $e}' \
+  update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", listenRetried: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
   if [[ $mode == extend ]]; then
@@ -994,7 +1040,8 @@ reconcile() {
       local was_running=false
       sunshine_running && { was_running=true; stop_sunshine; }
       restore_conf
-      [[ $was_running == true ]] && restart_sunshine
+      # Restart detached so `state` never trips service.luau's 15s poll timeout.
+      [[ $was_running == true ]] && setsid -f bash "$CTL" repair-sunshine stale >>"$LOG" 2>&1 </dev/null 9>&-
     fi
     return 0
   fi
@@ -1018,19 +1065,42 @@ reconcile() {
     fi
   fi
   # Sunshine can be running yet not accepting connections (a port was still
-  # in use when it started). Give a fresh start time to bind, then restart.
-  # Limit to one short attempt here so state polling stays under its 15s timeout.
-  local age p
-  age=$(sunshine_age)
+  # in use when it started). Give a fresh start time to bind, then schedule
+  # one detached restart per session so `state` stays fast and never loops.
+  local pid age p
+  pid=$(sunshine_pid)
+  age=$(sunshine_age "$pid")
   p=$(sunshine_port)
-  if [[ -n $age ]] && ((age > 20)) && ! sunshine_listening "$p"; then
-    log "reconcile: sunshine up ${age}s but not listening on $p/$((p + 21)); restarting"
-    if restart_sunshine 1 6; then
-      set_notice "Sunshine wasn't accepting connections, so it was restarted. Reconnect Moonlight."
-    fi
+  if [[ -n $pid && -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
+    log "reconcile: sunshine (pid $pid) up ${age}s but not listening on $p/$((p + 21)); scheduling restart"
+    update_session '.listenRetried = true'
+    setsid -f bash "$CTL" repair-sunshine active >>"$LOG" 2>&1 </dev/null 9>&-
   fi
 
   map_input_devices "$target"
+}
+
+# Detached Sunshine restart spawned by reconcile so `state` polls stay fast.
+cmd_repair_sunshine() { # stale|active
+  local kind=$1 s pid p
+  if [[ $kind == stale ]]; then
+    [[ $(session | jq -r .mode) == off ]] || return 0
+    sunshine_running && return 0
+    restart_sunshine 1 7 15 || true
+    return 0
+  fi
+  [[ $kind == active ]] || return 0
+  s=$(session)
+  [[ $(jq -r .mode <<<"$s") != off && -z $(jq -r .busy <<<"$s") ]] || return 0
+  pid=$(sunshine_pid)
+  p=$(sunshine_port)
+  [[ -n $pid ]] && ! sunshine_listening "$p" "$pid" || return 0
+  update_session '.busy = "restarting"'
+  if restart_sunshine 2 7 30; then
+    update_session '.busy = "" | .notice = $m' --arg m "Sunshine wasn't accepting connections, so it was restarted. Reconnect Moonlight."
+  else
+    update_session '.busy = ""'
+  fi
 }
 
 print_state() {
@@ -1130,7 +1200,7 @@ cmd_configure() { # json
   [[ $mode == off ]] && return 0
   if [[ $(jq -r .audio <<<"$new") != $(jq -r .audio <<<"$old") ]]; then
     # Only Sunshine reads this, and only at start.
-    apply_conf "$(jq -r .target <<<"$s")" && restart_sunshine
+    apply_conf "$(jq -r .target <<<"$s")" && restart_sunshine 1 7 15
   fi
   if [[ $mode == extend && $(jq -c 'del(.audio, .keepSunshine, .usbKeepInternet)' <<<"$new") != $(jq -c 'del(.audio, .keepSunshine, .usbKeepInternet)' <<<"$old") ]]; then
     set_notice "Turn the tablet display off and on again to apply the new device settings."
@@ -1212,6 +1282,7 @@ case "${1:-}" in
   configure) [[ $# -eq 2 ]] || usage; ensure_env; with_lock cmd_configure "$2" ;;
   hook-start) LOCK_WAIT=5 with_lock hook_start; exit 0 ;;
   hook-stop) LOCK_WAIT=5 with_lock hook_stop; exit 0 ;;
+  repair-sunshine) ensure_env; LOCK_WAIT=5 with_lock cmd_repair_sunshine "${2:-}" ;;
   pair) open_admin /pin ;;
   admin) open_admin ;;
   clear-errors) with_lock update_session '.errors = [] | .notice = ""' ;;
