@@ -206,9 +206,10 @@ choose_method() {
 # ---------------------------------------------------------------- monitors
 #
 # Every backend prints the same JSON array:
-#   [{name, enabled, focused, x, y, lw, lh, pw, ph, refresh, scale,
+#   [{name, enabled, focused, x, y, lw, lh, pw, ph, refresh, scale, rotated,
 #     modes: [{w, h, r}]}]
-# x/y/lw/lh are logical (scaled) coordinates; pw/ph the pixel mode.
+# x/y/lw/lh are logical (scaled, post-transform) coordinates; pw/ph the raw
+# pixel mode; rotated is true for 90°/270° transforms that swap width & height.
 
 MONS_OVERRIDE=""   # set by apply_display to place against remembered positions
 monitors_json() {
@@ -232,16 +233,22 @@ niri_monitors() {
       lw: (.logical.width // 0), lh: (.logical.height // 0),
       pw: ($m.width // 0), ph: ($m.height // 0),
       refresh: (($m.refresh_rate // 0) / 1000), scale: (.logical.scale // 1),
+      rotated: ((.logical.transform // "") | tostring | test("90|270")),
       modes: [.modes[] | {w: .width, h: .height, r: (.refresh_rate / 1000)}]
     }]' 2>/dev/null
 }
 
 hypr_monitors() {
   hyprctl -j monitors all 2>/dev/null | jq -c '
-    [.[] | {
+    [.[]
+     | (((.transform // 0) | floor) % 2 == 1) as $rot
+     | (if (.scale // 0) > 0 then .scale else 1 end) as $s
+     | {
       name, enabled: (.disabled != true), focused: (.focused == true),
-      x, y, lw: ((.width / .scale) | round), lh: ((.height / .scale) | round),
-      pw: .width, ph: .height, refresh: .refreshRate, scale,
+      x, y,
+      lw: (((if $rot then .height else .width end) / $s) | round),
+      lh: (((if $rot then .width else .height end) / $s) | round),
+      pw: .width, ph: .height, refresh: .refreshRate, scale: $s, rotated: $rot,
       modes: [(.availableModes // [])[]
               | capture("(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)")
               | {w: (.w | tonumber), h: (.h | tonumber), r: (.r | tonumber)}]
@@ -256,11 +263,16 @@ wlr_monitors() {
     mango) f=$(mmsg get all-monitors 2>/dev/null | jq -r '.monitors[]? | select(.active) | .name' 2>/dev/null | head -1) ;;
   esac
   wlr-randr --json 2>/dev/null | jq -c --arg f "$f" '
-    [.[] | ((.modes // []) | map(select(.current)) | .[0]) as $m | (.scale // 1) as $s | {
+    [.[]
+     | ((.modes // []) | map(select(.current)) | .[0]) as $m
+     | (if (.scale // 0) > 0 then .scale else 1 end) as $s
+     | ((.transform // "") | tostring | test("90|270")) as $rot
+     | {
       name, enabled: (.enabled == true), focused: (.name == $f),
       x: (.position.x // 0), y: (.position.y // 0),
-      lw: ((($m.width // 0) / $s) | round), lh: ((($m.height // 0) / $s) | round),
-      pw: ($m.width // 0), ph: ($m.height // 0), refresh: ($m.refresh // 0), scale: $s,
+      lw: (((if $rot then ($m.height // 0) else ($m.width // 0) end) / $s) | round),
+      lh: (((if $rot then ($m.width // 0) else ($m.height // 0) end) / $s) | round),
+      pw: ($m.width // 0), ph: ($m.height // 0), refresh: ($m.refresh // 0), scale: $s, rotated: $rot,
       modes: [(.modes // [])[] | {w: .width, h: .height, r: .refresh}]
     }]' 2>/dev/null
 }
@@ -551,10 +563,14 @@ placement() { # lw lh exclude
   pos=$(setting position)
   # The reference's size comes from its pixel mode, rounded up: compositors
   # report logical sizes rounded down (1600 / 1.5 = 1066.67 shows as 1066),
-  # and niri moves an output that overlaps another by even a fraction.
+  # and niri moves an output that overlaps another by even a fraction. Swap
+  # pw/ph when the reference monitor is rotated 90° or 270°.
   jq -r --arg p "$pos" --argjson lw "$1" --argjson lh "$2" '
-    (if .pw > 0 then ((.pw / .scale) | ceil) else .lw end) as $rw
-    | (if .ph > 0 then ((.ph / .scale) | ceil) else .lh end) as $rh
+    (if (.scale | type == "number" and . > 0) then .scale else 1 end) as $s
+    | (if .rotated then .ph else .pw end) as $ew
+    | (if .rotated then .pw else .ph end) as $eh
+    | (if $ew > 0 then (($ew / $s) | ceil) else .lw end) as $rw
+    | (if $eh > 0 then (($eh / $s) | ceil) else .lh end) as $rh
     | if $p == "left" then "\(.x - $lw) \(.y)"
       elif $p == "above" then "\(.x) \(.y - $lh)"
       elif $p == "below" then "\(.x) \(.y + $rh)"
