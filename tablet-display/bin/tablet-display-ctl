@@ -447,7 +447,49 @@ port_off() { # card-connector
   if ! err=$(pkexec "$HELPER" off "$1" 2>&1 >>"$LOG"); then
     log "port: $err"
     add_error "Could not release $1: ${err#port-helper: }"
+    return 1
   fi
+}
+
+# Connectors carrying our EDID (manufacturer "VDP", bytes 8-9 = 0x5890) that
+# this session doesn't own. They were forced on by a session that ended
+# without turning off, usually a logout: that wipes $XDG_RUNTIME_DIR and
+# session.json with it, but not the helper's state under /run, so the port
+# stays connected and the compositor keeps it as a monitor (with workspaces).
+orphan_ports() {
+  local own c base
+  own=$(session | jq -r '.port // empty')
+  for c in /sys/class/drm/card*-*; do
+    base=${c##*/}
+    [[ $base =~ ^card[0-9]+-(DP|HDMI-A|HDMI-B|DVI-D|DVI-I)-[0-9]+$ ]] || continue
+    [[ $base == "$own" ]] && continue
+    [[ $(cat "$c/status" 2>/dev/null) == connected ]] || continue
+    [[ $(od -An -tx1 -j8 -N2 "$c/edid" 2>/dev/null | tr -d ' \n') == 5890 ]] && echo "$base"
+  done
+}
+
+# Turns orphans off. The helper refuses any connector it didn't force, so a
+# real monitor is never touched. Returns 0 if it released something.
+# Reconcile runs on every state poll, so a port that failed to release is
+# remembered and skipped there (no pkexec and no repeated error every few
+# seconds); Extend and Off pass --retry to try it again.
+release_orphans() { # [--retry]
+  local c released=1 failed
+  helper_installed || return 1
+  failed=$(session | jq -c '.orphanFailed // []')
+  for c in $(orphan_ports); do
+    if [[ ${1:-} != --retry ]] && jq -e --arg c "$c" 'index($c)' <<<"$failed" >/dev/null; then
+      continue
+    fi
+    log "port: releasing $c, left on by an earlier session"
+    if port_off "$c"; then
+      released=0
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c])' --arg c "$c"
+    else
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c] + [$c])' --arg c "$c"
+    fi
+  done
+  return $released
 }
 
 # ---------------------------------------------------------------- virtual method
@@ -1196,6 +1238,7 @@ teardown() { # [notice] [--no-restart]
   update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
     --arg n "$notice"
   log "off"
+  release_orphans --retry && { sleep 0.3; rebase_layout; }
 }
 
 do_start() { # mode [target]
@@ -1215,6 +1258,7 @@ do_start() { # mode [target]
   update_session '. + {errors: [], notice: "", busy: "starting", mode: "off", client: null, listenRetried: false, compositor: $c, env: $e}' \
     --arg c "$COMP" --argjson e "$(env_snapshot)"
 
+  release_orphans --retry && sleep 0.3
   if [[ $mode == extend ]]; then
     # Where the real monitors are before the tablet appears; placement pins
     # them here (see apply_display).
@@ -1332,6 +1376,7 @@ reconcile() {
         log "reconcile: failed to restore $SUNSHINE_CONF"
       fi
     fi
+    release_orphans && { sleep 0.3; rebase_layout; }
     return 0
   fi
 
