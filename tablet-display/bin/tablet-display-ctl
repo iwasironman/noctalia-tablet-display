@@ -43,6 +43,7 @@ EDID_ARGS="$STATE_DIR/edid.args"
 # plugin without turning it off first cannot leave Sunshine calling a missing
 # file, which would abort every stream.
 HOOK="$STATE_DIR/sunshine-hook"
+CONF_BACKUP="$STATE_DIR/sunshine-conf-backup.json"
 SESSION="$RUN_DIR/session.json"
 LOCK="$RUN_DIR/lock"
 LOG="$RUN_DIR/ctl.log"
@@ -85,7 +86,11 @@ setting() { settings | jq -r --arg k "$1" '.[$k] // empty'; }
 write_atomic() { # file content
   local tmp
   tmp=$(mktemp "$1.XXXXXX") || return 1
-  printf '%s\n' "$2" >"$tmp" && mv -f "$tmp" "$1"
+  if [[ -n $2 ]]; then
+    printf '%s\n' "$2" >"$tmp"
+  else
+    : >"$tmp"
+  fi && mv -f "$tmp" "$1"
 }
 update_settings() { write_atomic "$SETTINGS" "$(settings | jq -c "$@")"; }
 update_session() { write_atomic "$SESSION" "$(session | jq -c "$@")"; }
@@ -782,22 +787,154 @@ _restart_sunshine_once() {
   done
 }
 
-conf_has_block() { [[ -f $SUNSHINE_CONF ]] && grep -qF "$MARK_BEGIN" "$SUNSHINE_CONF"; }
+# Filters our hook entries out of a JSON global_prep_cmd value.
+# Prints the filtered compact JSON array, or returns 1 if input is not a JSON array.
+strip_our_hook_json() { # raw_json
+  jq -ce --arg c "$HOOK" '
+    def is_ours:
+      type == "object" and (
+        (((.do // "") | tostring) | (. == $c or startswith($c + " ")))
+        or (((.undo // "") | tostring) | (. == $c or startswith($c + " ")))
+      );
+    if type == "array" then map(select(is_ours | not)) else error("not array") end
+  ' <<<"$1" 2>/dev/null
+}
 
-# Puts sunshine.conf back exactly as the user had it.
+conf_has_markers() {
+  [[ -f $SUNSHINE_CONF ]] || return 1
+  grep -qxF "$MARK_BEGIN" "$SUNSHINE_CONF" && return 0
+  awk -v p="$DISABLED_PREFIX" 'index($0, p) == 1 { f = 1; exit } END { exit !f }' "$SUNSHINE_CONF"
+}
+
+# True iff any uncommented global_prep_cmd line in sunshine.conf is a JSON array
+# containing an entry that strip_our_hook_json would remove.
+conf_has_our_hook() {
+  [[ -f $SUNSHINE_CONF ]] || return 1
+  local val orig filtered
+  while IFS= read -r val || [[ -n $val ]]; do
+    [[ -n $val ]] || continue
+    if filtered=$(strip_our_hook_json "$val") && orig=$(jq -c . <<<"$val" 2>/dev/null); then
+      [[ $filtered != "$orig" ]] && return 0
+    fi
+  done < <(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF")
+  return 1
+}
+
+backup_valid() {
+  jq -e 'type == "object" and (.other | type == "array" and all(type == "string")) and (.prep | type == "array" and all(type == "string"))' "$CONF_BACKUP" >/dev/null 2>&1
+}
+
+# True iff apply_conf merged the last backed-up global_prep_cmd line into its
+# own (it merges only the last line, and only when its value is a JSON array);
+# also true when there was none.
+backup_last_prep_merged() {
+  local val
+  [[ $(jq -r '.prep | length' "$CONF_BACKUP") != 0 ]] || return 0
+  val=$(jq -r '.prep[-1]' "$CONF_BACKUP" | sed -E 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//')
+  strip_our_hook_json "$val" >/dev/null
+}
+
+conf_is_managed() { conf_has_markers || [[ -f $CONF_BACKUP ]] || conf_has_our_hook; }
+
+conf_managed_reason() {
+  local r=()
+  conf_has_markers && r+=(markers)
+  [[ -f $CONF_BACKUP ]] && r+=(backup)
+  conf_has_our_hook && r+=(hook)
+  local IFS=,
+  echo "${r[*]}"
+}
+
+# Puts sunshine.conf back as the user had it. When our comment markers are
+# intact, simply remove the managed block and uncomment the user's original
+# lines. If Sunshine's Web UI rewrote sunshine.conf while we were active (which
+# strips all comments), fall back to $CONF_BACKUP: all non-managed Web UI edits
+# are preserved, output_name/capture/stream_audio revert to their pre-session
+# values, and only our hook is stripped from global_prep_cmd (if the user
+# deleted global_prep_cmd in the Web UI, it stays absent). The user's original
+# global_prep_cmd lines come back from the backup when apply_conf could not
+# merge them (several lines, or a value that is not a JSON array). A corrupt
+# backup is moved aside and only our hook is stripped.
 restore_conf() {
-  [[ -f $SUNSHINE_CONF ]] || return 0
-  local out
-  out=$(awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v p="$DISABLED_PREFIX" '
-    $0 == b { skip = 1; next }
-    skip && $0 == e { skip = 0; next }
-    skip { next }
-    index($0, p) == 1 { print substr($0, length(p) + 1); next }
-    { print }
-  ' "$SUNSHINE_CONF") || return 1
-  # Drop the blank line apply_conf added before the block.
-  out=$(printf '%s\n' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
-  write_atomic "$SUNSHINE_CONF" "$out"
+  if [[ ! -f $SUNSHINE_CONF ]]; then
+    rm -f "$CONF_BACKUP"
+    return 0
+  fi
+  conf_is_managed || return 0
+
+  local out=""
+  if ! conf_has_markers && [[ -f $CONF_BACKUP ]] && ! backup_valid; then
+    # Without markers a corrupt backup is useless: move it aside so it can't
+    # block every later start and reconcile, and fall back to stripping our hook.
+    mv -f "$CONF_BACKUP" "$CONF_BACKUP.corrupt" || return 1
+    log "restore_conf: corrupt backup moved to $CONF_BACKUP.corrupt"
+    add_error "Could not fully restore $SUNSHINE_CONF (backup was corrupt); check output_name, capture and stream_audio"
+    conf_has_our_hook || return 0
+  fi
+  if conf_has_markers; then
+    out=$(awk -v b="$MARK_BEGIN" -v e="$MARK_END" -v p="$DISABLED_PREFIX" '
+      $0 == b { skip = 1; next }
+      skip && $0 == e { skip = 0; next }
+      skip { next }
+      index($0, p) == 1 { print substr($0, length(p) + 1); next }
+      { print }
+    ' "$SUNSHINE_CONF") || return 1
+    # Drop the blank line apply_conf added before the block.
+    out=$(printf '%s\n' "$out" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  elif [[ -f $CONF_BACKUP ]]; then
+    # Markers were stripped (e.g. saved via Sunshine's Web UI); the backup was
+    # validated above.
+    local body existing_prep filtered_prep restored_other restored_prep extra="" live_prep="" earlier_prep
+    body=$(awk -v keys="^[[:space:]]*($MANAGED_KEYS)[[:space:]]*=" '$0 ~ keys { next } { print }' "$SUNSHINE_CONF") || return 1
+    restored_other=$(jq -r '(.other // [])[]' "$CONF_BACKUP") || return 1
+    existing_prep=$(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF" | tail -1)
+    # apply_conf merged only the user's last global_prep_cmd line, and only if
+    # it was a JSON array, so the live value (which the Web UI may have edited)
+    # speaks for that line alone. Earlier lines, and an unmerged last line,
+    # never reached the live value: only the backup still has them.
+    earlier_prep=$(jq -r '(.prep // [])[:-1][]' "$CONF_BACKUP") || return 1
+    if [[ -n $existing_prep ]] && filtered_prep=$(strip_our_hook_json "$existing_prep"); then
+      [[ $filtered_prep != "[]" ]] && live_prep="global_prep_cmd = $filtered_prep"
+    fi
+    restored_prep=$earlier_prep
+    if [[ -n $live_prep ]]; then
+      restored_prep="${restored_prep:+$restored_prep$'\n'}$live_prep"
+    elif ! backup_last_prep_merged || { [[ -n $existing_prep ]] && [[ -z $filtered_prep ]]; }; then
+      # The last line was never merged, or the live value is unparseable:
+      # put the user's original last line back.
+      restored_prep="${restored_prep:+$restored_prep$'\n'}$(jq -r '.prep[-1] // empty' "$CONF_BACKUP")" || return 1
+    fi
+    [[ -n $restored_other ]] && extra="$restored_other"
+    if [[ -n $restored_prep ]]; then
+      extra="${extra:+$extra$'\n'}$restored_prep"
+    fi
+    out="$body"
+    if [[ -n $extra ]]; then
+      out="${out:+$out$'\n'}$extra"
+    fi
+  elif conf_has_our_hook; then
+    # No markers and no backup file: rewrite only global_prep_cmd lines that
+    # contain our hook, preserving any earlier or unrelated lines untouched.
+    local line val orig filtered new_lines=()
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line =~ ^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+        val=${BASH_REMATCH[1]}
+        if filtered=$(strip_our_hook_json "$val") && orig=$(jq -c . <<<"$val" 2>/dev/null) && [[ $filtered != "$orig" ]]; then
+          [[ $filtered != "[]" ]] && new_lines+=("global_prep_cmd = $filtered")
+          continue
+        fi
+      fi
+      new_lines+=("$line")
+    done <"$SUNSHINE_CONF"
+    if ((${#new_lines[@]})); then
+      out=$(printf '%s\n' "${new_lines[@]}")
+    else
+      out=""
+    fi
+  fi
+
+  write_atomic "$SUNSHINE_CONF" "$out" || return 1
+  rm -f "$CONF_BACKUP"
 }
 
 # Sunshine runs prep commands directly, without a shell, and aborts the
@@ -821,7 +958,7 @@ HOOK_EOF
 }
 
 apply_conf() { # output_name
-  local target="$1" audio existing ours merged body
+  local target="$1" audio existing filtered ours merged body backup_json content
   restore_conf || return 1
   mkdir -p "$(dirname "$SUNSHINE_CONF")"
   touch "$SUNSHINE_CONF"
@@ -830,20 +967,47 @@ apply_conf() { # output_name
 
   ours=$(jq -cn --arg c "$HOOK" '[{do: ($c + " hook-start"), undo: ($c + " hook-stop"), elevated: false}]')
   existing=$(sed -nE 's/^[[:space:]]*global_prep_cmd[[:space:]]*=[[:space:]]*//p' "$SUNSHINE_CONF" | tail -1)
-  merged=$(jq -c --argjson o "$ours" '(if type == "array" then . else [] end) + $o' <<<"${existing:-[]}" 2>/dev/null) || merged="$ours"
+  if [[ -n $existing ]] && filtered=$(strip_our_hook_json "$existing"); then
+    merged=$(jq -cn --argjson f "$filtered" --argjson o "$ours" '$f + $o' 2>/dev/null) || merged="$ours"
+  else
+    merged="$ours"
+  fi
   audio=$(settings | jq -r 'if .audio then "enabled" else "disabled" end')
+
+  backup_json=$(awk -v keys="^[[:space:]]*($MANAGED_KEYS)[[:space:]]*=" '$0 ~ keys { print }' "$SUNSHINE_CONF" | jq -Rsc '
+    split("\n") | map(select(. != ""))
+    | {
+        other: map(select(test("^[[:space:]]*global_prep_cmd[[:space:]]*=") | not)),
+        prep: map(select(test("^[[:space:]]*global_prep_cmd[[:space:]]*=")))
+      }') || return 1
+  write_atomic "$CONF_BACKUP" "$backup_json" || return 1
 
   body=$(awk -v p="$DISABLED_PREFIX" -v keys="^[[:space:]]*($MANAGED_KEYS)[[:space:]]*=" '
     $0 ~ keys { print p $0; next } { print }
-  ' "$SUNSHINE_CONF") || return 1
+  ' "$SUNSHINE_CONF") || { rm -f "$CONF_BACKUP"; return 1; }
 
-  write_atomic "$SUNSHINE_CONF" "$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n%s' \
-    "$body" "$MARK_BEGIN" \
-    "output_name = $target" \
-    "capture = wlr" \
-    "stream_audio = $audio" \
-    "global_prep_cmd = $merged" \
-    "$MARK_END")"
+  if [[ -n $body ]]; then
+    content=$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n%s' \
+      "$body" "$MARK_BEGIN" \
+      "output_name = $target" \
+      "capture = wlr" \
+      "stream_audio = $audio" \
+      "global_prep_cmd = $merged" \
+      "$MARK_END")
+  else
+    content=$(printf '%s\n%s\n%s\n%s\n%s\n%s' \
+      "$MARK_BEGIN" \
+      "output_name = $target" \
+      "capture = wlr" \
+      "stream_audio = $audio" \
+      "global_prep_cmd = $merged" \
+      "$MARK_END")
+  fi
+
+  if ! write_atomic "$SUNSHINE_CONF" "$content"; then
+    rm -f "$CONF_BACKUP"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------- USB tethering
@@ -1035,13 +1199,20 @@ reconcile() {
   if [[ $mode == off ]]; then
     # Left over from a crash or a reboot: the config still points Sunshine at
     # a display that may not exist, and Sunshine would stream another one.
-    if conf_has_block; then
-      log "reconcile: stale sunshine.conf block"
-      local was_running=false
-      sunshine_running && { was_running=true; stop_sunshine; }
-      restore_conf
-      # Restart detached so `state` never trips service.luau's 15s poll timeout.
-      [[ $was_running == true ]] && setsid -f bash "$CTL" repair-sunshine stale >>"$LOG" 2>&1 </dev/null 9>&-
+    if conf_is_managed; then
+      log "reconcile: stale managed sunshine.conf ($(conf_managed_reason))"
+      local before="" after=""
+      [[ -f $SUNSHINE_CONF ]] && before=$(cat "$SUNSHINE_CONF")
+      if restore_conf; then
+        [[ -f $SUNSHINE_CONF ]] && after=$(cat "$SUNSHINE_CONF")
+        if [[ $before != "$after" ]] && sunshine_running; then
+          stop_sunshine
+          # Restart detached so `state` never trips service.luau's 15s poll timeout.
+          setsid -f bash "$CTL" repair-sunshine stale >>"$LOG" 2>&1 </dev/null 9>&-
+        fi
+      else
+        log "reconcile: failed to restore $SUNSHINE_CONF"
+      fi
     fi
     return 0
   fi
@@ -1220,7 +1391,7 @@ cmd_doctor() {
   echo "sunshine running: $(sunshine_running && echo yes || echo no)"
   echo "systemd unit:     $(sunshine_has_unit && echo "$SUNSHINE_UNIT ($(systemctl --user is-active "$SUNSHINE_UNIT"))" || echo none)"
   echo "sunshine hook:    $HOOK -> $CTL"
-  echo "sunshine.conf:    $SUNSHINE_CONF ($(conf_has_block && echo managed || echo untouched))"
+  echo "sunshine.conf:    $SUNSHINE_CONF ($(conf_is_managed && echo "managed ($(conf_managed_reason))" || echo untouched))"
   echo "port helper:      $(helper_installed && echo "installed (version $("$HELPER" version), $(helper_current && echo current || echo OUTDATED))" || echo 'not installed')"
   echo "kernel lockdown:  $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unknown)"
   echo "free ports:       $(free_ports | paste -sd' ')"
@@ -1288,8 +1459,16 @@ case "${1:-}" in
   clear-errors) with_lock update_session '.errors = [] | .notice = ""' ;;
   uninstall)
     ensure_env
-    with_lock teardown
-    restore_conf
+    with_lock teardown || exit $?
+    restored=true
+    restore_conf || restored=false
+    if [[ $restored != true ]] || conf_has_our_hook || { [[ -f $SUNSHINE_CONF ]] && grep -qF -- "$HOOK" "$SUNSHINE_CONF"; }; then
+      # Keep $HOOK (and $CONF_BACKUP) so Sunshine streams don't abort on a missing prep command.
+      rm -rf "$RUN_DIR"
+      rm -f "$SETTINGS" "$EDID" "$EDID_ARGS"
+      echo "$APP: warning: could not fully clean $SUNSHINE_CONF; kept $HOOK so Sunshine keeps working." >&2
+      exit 1
+    fi
     rm -rf "$STATE_DIR" "$RUN_DIR"
     echo "$APP: turned off, sunshine.conf restored, state removed."
     ;;
