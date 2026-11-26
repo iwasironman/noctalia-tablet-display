@@ -72,15 +72,37 @@ def cvt_rb2(h, v, refresh):
     return timing(h, v, refresh, 80, 32, 8, vbi, vbi - 8 - 6, 8, 10)
 
 
+MIN_REFRESH = 15.0
+MAX_REFRESH = 500.0
+MAX_DTD_SLOTS = 9
+MAX_DID_SLOTS = 5
+MAX_TOTAL_MODES = MAX_DTD_SLOTS + MAX_DID_SLOTS
+
+
+def fits_dtd(t):
+    """Whether timing t fits the bit-width limits of an 18-byte EDID 1.4 DTD."""
+    return (
+        10 <= t["pclk_khz"] <= DTD_MAX_KHZ
+        and t["h"] <= 4095 and t["h_blank"] <= 4095
+        and t["v"] <= 4095 and t["v_blank"] <= 4095
+        and t["h_front"] <= 1023 and t["h_sync"] <= 1023
+        and t["v_front"] <= 63 and t["v_sync"] <= 63
+    )
+
+
 def plan_mode(w, h, hz):
     if w < 320 or h < 200 or w > 8192 or h > 8192:
         raise ValueError(f"unsupported size {w}x{h}")
+    if not (math.isfinite(hz) and MIN_REFRESH <= hz <= MAX_REFRESH):
+        raise ValueError(f"unsupported refresh rate {hz} Hz (expected {MIN_REFRESH:g}-{MAX_REFRESH:g})")
     t = cvt_rb1(w, h, hz)
-    if t["pclk_khz"] <= DTD_MAX_KHZ:
+    if fits_dtd(t):
         t["where"] = "dtd"
         return t
     t = cvt_rb2(w, h, hz)
-    t["where"] = "dtd" if t["pclk_khz"] <= DTD_MAX_KHZ else "displayid"
+    if t["pclk_khz"] < 10 or (t["pclk_khz"] // 10 - 1) > 0xFFFFFF:
+        raise ValueError(f"pixel clock out of DisplayID range for {w}x{h}@{hz}")
+    t["where"] = "dtd" if fits_dtd(t) else "displayid"
     return t
 
 
@@ -90,8 +112,8 @@ def dtd(t, size_mm):
     h, hb, v, vb = t["h"], t["h_blank"], t["v"], t["v_blank"]
     hfp, hs, vfp, vs = t["h_front"], t["h_sync"], t["v_front"], t["v_sync"]
     # Image size follows each mode's aspect ratio, at the panel's width.
-    wmm = size_mm[0]
-    hmm = round(wmm * v / h)
+    wmm = min(4095, max(0, size_mm[0]))
+    hmm = min(4095, max(0, round(wmm * v / h)))
     return bytes([
         clk & 0xFF, clk >> 8,
         h & 0xFF, hb & 0xFF, ((h >> 8) << 4) | (hb >> 8),
@@ -124,7 +146,8 @@ def displayid_type1(t):
 
 
 def text_descriptor(tag, text):
-    data = text.encode("ascii")[:13]
+    cleaned = "".join(ch if 0x20 <= ord(ch) <= 0x7E else "?" for ch in text).strip() or "TabletDisplay"
+    data = cleaned.encode("ascii")[:13]
     if len(data) < 13:
         data += b"\n" + b" " * (12 - len(data))
     return bytes([0, 0, 0, tag, 0]) + data
@@ -145,7 +168,7 @@ def base_block(name, size_mm, timings, extensions):
     b += bytes([1, 2026 - 1990])           # week 1, 2026
     b += bytes([1, 4])                     # EDID 1.4
     b += bytes([0xA5])                     # digital, 8 bpc, DisplayPort
-    b += bytes([round(size_mm[0] / 10), round(size_mm[1] / 10)])
+    b += bytes([min(255, max(0, round(size_mm[0] / 10))), min(255, max(0, round(size_mm[1] / 10)))])
     b += bytes([120])                      # gamma 2.2
     b += bytes([0x06])                     # sRGB default, preferred timing is native
     b += bytes([0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54])  # sRGB
@@ -185,19 +208,21 @@ def displayid_block(timings):
 
 
 def build(name, size_mm, modes):
+    if not modes:
+        raise ValueError("at least one mode is required")
     planned = [plan_mode(*m) for m in modes]
-    if planned[0]["where"] != "dtd":
-        raise ValueError("the first (preferred) mode must fit a detailed timing; list a slower one first")
     dtds = [t for t in planned if t["where"] == "dtd"]
     dids = [t for t in planned if t["where"] == "displayid"]
+    if not dtds:
+        raise ValueError("at least one mode must fit a detailed timing (<= 4095x4095 and <= 655.35 MHz)")
     # Overflow past the 9 DTD slots also goes into DisplayID, which can hold
     # any timing.
-    for t in dtds[9:]:
+    for t in dtds[MAX_DTD_SLOTS:]:
         t["where"] = "displayid"
-    dids += dtds[9:]
-    dtds = dtds[:9]
-    if len(dids) > 5:
-        raise ValueError(f"{len(dtds) + len(dids)} modes; at most 14 fit (9 DTD + 5 DisplayID)")
+    dids += dtds[MAX_DTD_SLOTS:]
+    dtds = dtds[:MAX_DTD_SLOTS]
+    if len(dids) > MAX_DID_SLOTS:
+        raise ValueError(f"{len(dtds) + len(dids)} modes; at most {MAX_TOTAL_MODES} fit ({MAX_DTD_SLOTS} DTD + {MAX_DID_SLOTS} DisplayID)")
 
     exts = []
     if len(dtds) > 3:
@@ -209,7 +234,10 @@ def build(name, size_mm, modes):
 
 def parse_res(s):
     w, h = s.lower().split("x")
-    return int(w), int(h)
+    w, h = int(w), int(h)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"invalid dimensions {s!r}")
+    return w, h
 
 
 def parse_mode(s):
@@ -221,11 +249,62 @@ def parse_mode(s):
 
 
 def default_modes(native, rates, extras):
+    if not rates:
+        raise ValueError("at least one refresh rate is required")
     nw, nh = native
-    modes = [(nw, nh, r) for r in rates]
+    rates = sorted(set(rates))
+
+    # Plan native modes first so invalid sizes/rates still error immediately.
+    native_planned = [(m, plan_mode(*m)) for m in ((nw, nh, r) for r in rates)]
+    native_dtds = [item for item in native_planned if item[1]["where"] == "dtd"]
+    native_dids = [item for item in native_planned if item[1]["where"] == "displayid"]
+
+    # EDID 1.4 requires at least one DTD in the base block. If every requested
+    # native rate needs DisplayID (e.g. --refresh 120 on 2960x1848, or >=4096px
+    # width), prepend a 60 Hz DTD fallback so the EDID stays valid while still
+    # offering all requested native rates.
+    fallback = None
+    if not native_dtds:
+        if plan_mode(nw, nh, 60.0)["where"] == "dtd":
+            fallback = (nw, nh, 60.0)
+        else:
+            for w, h in extras:
+                if (w, h) != (nw, nh) and w <= nw and h <= nh and plan_mode(w, h, 60.0)["where"] == "dtd":
+                    fallback = (w, h, 60.0)
+                    break
+            if fallback is None:
+                fallback = (1920, 1080, 60.0)
+
+    modes = []
+    seen = set()
+    did_count = 0
+
+    def try_add(m):
+        nonlocal did_count
+        if m in seen or len(modes) >= MAX_TOTAL_MODES:
+            return False
+        t = plan_mode(*m)
+        if t["where"] == "displayid" and did_count >= MAX_DID_SLOTS:
+            return False
+        seen.add(m)
+        modes.append(m)
+        if t["where"] == "displayid":
+            did_count += 1
+        return True
+
+    if fallback is not None:
+        try_add(fallback)
+    # Keep native DTDs first, then native DisplayIDs (preferring fastest if >5).
+    for m, _ in native_dtds:
+        try_add(m)
+    for m, _ in native_dids[-MAX_DID_SLOTS:]:
+        try_add(m)
+
+    # Fill remaining capacity with smaller extra resolutions without overflowing.
     for w, h in extras:
         if (w, h) != (nw, nh) and w <= nw and h <= nh:
-            modes += [(w, h, r) for r in rates]
+            for r in rates:
+                try_add((w, h, r))
     return modes
 
 

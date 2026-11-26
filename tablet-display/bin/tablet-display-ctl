@@ -321,7 +321,19 @@ build_edid() {
   w=$(jq -r .w <<<"$p"); h=$(jq -r .h <<<"$p")
   diag=$(jq -r .diag <<<"$p"); name=$(jq -r .name <<<"$p")
   rates=$(setting refreshRates)
-  [[ $rates =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || rates="60,90,120"
+  # Keep only rates make-edid.py accepts (15-500 Hz), so one bad entry in the
+  # free-text setting is dropped instead of failing the whole EDID.
+  local list r ip kept=()
+  IFS=, read -ra list <<<"${rates//[[:space:]]/}"
+  for r in "${list[@]}"; do
+    [[ $r =~ ^([0-9]{1,6})(\.([0-9]+))?$ ]] || continue
+    ip=$((10#${BASH_REMATCH[1]}))
+    if ((ip >= 15 && ip < 500)) || { ((ip == 500)) && [[ ${BASH_REMATCH[3]:-0} =~ ^0+$ ]]; }; then
+      kept+=("$r")
+    fi
+  done
+  rates=$(IFS=,; echo "${kept[*]}")
+  [[ -n $rates ]] || rates="60,90,120"
   # Physical size from the diagonal; without one assume ~220 ppi, which only
   # affects what the compositor reports, not the picture.
   read -r wmm hmm < <(awk -v w="$w" -v h="$h" -v d="$diag" 'BEGIN {
