@@ -14,6 +14,7 @@ local ACTION_TIMEOUT_MS = 60000
 local snapshot = { loading = true, mode = "off" }
 local actionInFlight = "" -- "", or the action being run
 local polling = false
+local pollGen = 0
 local lastConfig = ""
 local lastSerial = nil
 
@@ -44,16 +45,24 @@ local function publish()
   noctalia.setUpdateInterval((active or actionInFlight ~= "") and ACTIVE_INTERVAL_MS or IDLE_INTERVAL_MS)
 end
 
-local function poll()
+local function poll(force)
   if polling then
+    if force then
+      pollGen = pollGen + 1
+    end
     return
   end
   polling = true
+  local gen = pollGen
   -- While an action holds the script's lock, ask for state without the
   -- reconcile pass (it would only wait for the lock).
   local args = actionInFlight ~= "" and { "state", "--no-reconcile" } or { "state" }
   run(args, function(result)
     polling = false
+    if gen ~= pollGen then
+      poll(false)
+      return
+    end
     if result and result.exitCode == 0 then
       local ok, data = pcall(noctalia.json.decode, result.stdout or "")
       if ok and type(data) == "table" then
@@ -89,7 +98,7 @@ end
 local function pushConfig(thenPoll)
   local json = configJson()
   if json == lastConfig then
-    if thenPoll then poll() end
+    if thenPoll then poll(true) end
     return
   end
   lastConfig = json
@@ -97,7 +106,7 @@ local function pushConfig(thenPoll)
     if result and result.exitCode ~= 0 then
       noctalia.log("configure failed: " .. tostring(result.stderr))
     end
-    if thenPoll then poll() end
+    if thenPoll then poll(true) end
   end)
 end
 
@@ -106,7 +115,7 @@ local LONG_ACTIONS = { extend = true, mirror = true, off = true, set = true }
 local function runAction(command)
   local action = command.action
   if action == "refresh" then
-    poll()
+    poll(true)
     return
   end
 
@@ -124,7 +133,7 @@ local function runAction(command)
   end
 
   if action == "pair" or action == "admin" or action == "clear-errors" then
-    run({ action }, function() poll() end)
+    run({ action }, function() poll(true) end)
     return
   end
 
@@ -156,7 +165,7 @@ local function runAction(command)
         noctalia.notifyError(tr("title"), msg)
       end
     end
-    poll()
+    poll(true)
   end, ACTION_TIMEOUT_MS)
 end
 
@@ -173,7 +182,7 @@ noctalia.state.watch(COMMAND_KEY, function(command)
 end)
 
 function update()
-  poll()
+  poll(false)
 end
 
 function onConfigChanged()
@@ -181,7 +190,7 @@ function onConfigChanged()
 end
 
 function onResume()
-  poll()
+  poll(true)
 end
 
 function onIpc(event, _payload)
@@ -190,7 +199,7 @@ function onIpc(event, _payload)
   elseif event == "toggle" then
     runAction({ action = (snapshot.mode == "off" or snapshot.mode == nil) and "extend" or "off" })
   else
-    poll()
+    poll(true)
   end
 end
 
