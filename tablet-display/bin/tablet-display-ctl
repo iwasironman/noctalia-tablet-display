@@ -782,7 +782,10 @@ unmap_input_devices() {
   if [[ $COMP == hyprland ]]; then
     while IFS= read -r entry; do
       name="${entry%%=*}"
-      [[ -n $name ]] && hyprctl eval "hl.device({ name = \"$name\", output = \"\" })" >/dev/null 2>&1
+      [[ -n $name && $name =~ ^[A-Za-z0-9._:()-]+$ ]] || continue
+      if [[ $(hyprctl eval "hl.device({ name = \"$name\", output = \"\" })" 2>&1) != ok* ]]; then
+        hyprctl keyword "device[$name]:output" "" >/dev/null 2>&1 || true
+      fi
     done < <(session | jq -r '.mapped[]?')
   fi
   update_session '.mapped = []'
