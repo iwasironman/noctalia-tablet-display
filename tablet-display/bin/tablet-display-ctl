@@ -1171,8 +1171,8 @@ remove_display() { # session-json
   esac
 }
 
-teardown() { # [notice]
-  local s mode was
+teardown() { # [notice] [--no-restart]
+  local notice=${1:-} no_restart=${2:-} s mode was
   s=$(session)
   mode=$(jq -r .mode <<<"$s")
   was=$(jq -r .sunshineWasRunning <<<"$s")
@@ -1190,11 +1190,11 @@ teardown() { # [notice]
   fi
   # Off means nothing is streamed: leave Sunshine stopped, unless the user
   # asked to keep it running (as it was before we started).
-  if [[ $mode != off && $was == true && $(setting keepSunshine) == true ]]; then
+  if [[ $no_restart != --no-restart && $mode != off && $was == true && $(setting keepSunshine) == true ]]; then
     restart_sunshine 1 7 15 || true
   fi
   update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
-    --arg n "${1:-}"
+    --arg n "$notice"
   log "off"
 }
 
@@ -1229,7 +1229,13 @@ do_start() { # mode [target]
     fi
     target=$out
     update_session '. + {method: $m, output: $o}' --arg m "$method" --arg o "$out"
-    apply_display "$out" "$method" || true
+    if ! apply_display "$out" "$method"; then
+      remove_display "$(session)"
+      sleep 0.3
+      rebase_layout
+      update_session '. + {mode: "off", method: "", output: "", port: "", target: "", applied: "", busy: ""}'
+      return 1
+    fi
   else
     [[ -n $target ]] || target=$(reference_monitor | jq -r '.name // empty')
     if [[ -z $target ]] || ! monitor_exists "$target"; then
@@ -1244,13 +1250,23 @@ do_start() { # mode [target]
   update_session '. + {mode: $m, target: $t, sunshineWasRunning: $w}' \
     --arg m "$mode" --arg t "$target" --argjson w "$was"
 
+  # Errors from earlier steps (e.g. a port candidate port_on skipped) may
+  # already be listed; only skip the generic error if apply_conf added its own.
+  local errs_before
+  errs_before=$(session | jq -c '.errors')
   if ! apply_conf "$target"; then
-    add_error "Could not write $SUNSHINE_CONF"
-    teardown
+    [[ $(session | jq -c '.errors') == "$errs_before" ]] && add_error "Could not write $SUNSHINE_CONF"
+    restore_conf || true
+    if [[ $mode == extend ]]; then
+      remove_display "$(session)"
+      sleep 0.3
+      rebase_layout
+    fi
+    update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: ""}'
     return 1
   fi
   if ! restart_sunshine; then
-    update_session '.busy = ""'
+    teardown "" --no-restart
     return 1
   fi
   update_session '.busy = ""'
