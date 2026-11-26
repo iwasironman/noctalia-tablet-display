@@ -40,7 +40,7 @@ end
 
 local function modeButtons()
   local mode = snapshot.mode or "off"
-  local enabled = not busy() and snapshot.installed ~= false
+  local enabled = not busy() and snapshot.available ~= false and snapshot.installed ~= false
   local helperMissing = snapshot.helper and snapshot.helper.needed and not snapshot.helper.installed
   local function btn(id, glyph, blocked)
     return ui.button({
@@ -64,6 +64,7 @@ end
 
 local function placementCard()
   local pos = snapshot.position or "right"
+  local canEdit = not busy() and snapshot.available ~= false
   local row = {}
   for _, p in ipairs(POSITIONS) do
     table.insert(row, ui.button({
@@ -72,7 +73,7 @@ local function placementCard()
       tooltip = tr("panel.position." .. p.id),
       variant = pos == p.id and "primary" or "ghost",
       selected = pos == p.id,
-      enabled = not busy(),
+      enabled = canEdit,
       flexGrow = 1,
       onClick = function()
         if p.id ~= pos then common.send("set", { key = "position", value = p.id }) end
@@ -81,14 +82,24 @@ local function placementCard()
   end
 
   local current = snapshot.scaleSetting or "auto"
-  local labels, selected = {}, 0
-  for i, s in ipairs(SCALES) do
+  local autoScale = snapshot.autoScale or snapshot.scale or "?"
+  local scales, labels, selected, found = {}, {}, 0, false
+  for _, s in ipairs(SCALES) do
+    table.insert(scales, s)
     if s == "auto" then
-      table.insert(labels, tr("panel.scale_auto", { scale = snapshot.scale or "?" }))
+      table.insert(labels, tr("panel.scale_auto", { scale = autoScale }))
     else
       table.insert(labels, s .. "×")
     end
-    if s == current then selected = i - 1 end
+    if s == current then
+      selected = #scales - 1
+      found = true
+    end
+  end
+  if not found and current ~= "" then
+    table.insert(scales, current)
+    table.insert(labels, current .. "×")
+    selected = #scales - 1
   end
 
   return card({
@@ -99,11 +110,11 @@ local function placementCard()
       ui.select({
         options = labels,
         selectedIndex = selected,
-        enabled = not busy(),
+        enabled = canEdit,
         width = 160,
         controlSize = "sm",
         onChange = function(index)
-          local s = SCALES[(tonumber(index) or 0) + 1]
+          local s = scales[(tonumber(index) or 0) + 1]
           if s and s ~= current then common.send("set", { key = "scale", value = s }) end
         end,
       }),
@@ -180,9 +191,11 @@ local function notices(children)
     any = true
     table.insert(children, message(snapshot.notice, "on_surface", "info-circle"))
   end
-  for _, err in ipairs(snapshot.errors or {}) do
-    any = true
-    table.insert(children, message(tostring(err), "error", "alert-triangle"))
+  if snapshot.available ~= false then
+    for _, err in ipairs(snapshot.errors or {}) do
+      any = true
+      table.insert(children, message(tostring(err), "error", "alert-triangle"))
+    end
   end
   if any and snapshot.available ~= false then
     table.insert(children, ui.button({ text = tr("panel.dismiss"), variant = "ghost", controlSize = "sm",

@@ -10,6 +10,9 @@ local COMMAND_KEY = "td_command"
 local ACTIVE_INTERVAL_MS = 2000
 local IDLE_INTERVAL_MS = 8000
 local ACTION_TIMEOUT_MS = 60000
+-- configure waits up to 10s for the script's lock (then exits 75, "busy") and
+-- may restart Sunshine (~20s worst case); leave room for both.
+local CONFIGURE_TIMEOUT_MS = 45000
 
 local snapshot = { loading = true, mode = "off" }
 local actionInFlight = "" -- "", or the action being run
@@ -159,7 +162,7 @@ local function pushConfig(thenPoll)
       end
     end
     if shouldPoll then poll(true) end
-  end)
+  end, CONFIGURE_TIMEOUT_MS)
 end
 
 local LONG_ACTIONS = { extend = true, mirror = true, off = true, set = true }

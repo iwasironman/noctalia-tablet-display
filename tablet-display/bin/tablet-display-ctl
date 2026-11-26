@@ -393,14 +393,18 @@ free_ports() {
 }
 
 port_candidates() {
-  local want working
+  local want working free
   want=$(setting port)
   if [[ -n $want && $want != auto ]]; then echo "$want"; return; fi
   working=$(setting workingPort)
-  local free
   free=$(free_ports)
-  [[ -n $working ]] && grep -qx "$working" <<<"$free" && echo "$working"
-  grep -vx "${working:-//}" <<<"$free"
+  [[ -n $free ]] || return 0
+  if [[ -n $working ]] && grep -qxF -- "$working" <<<"$free"; then
+    echo "$working"
+    grep -vxF -- "$working" <<<"$free" || true
+  else
+    printf '%s\n' "$free"
+  fi
 }
 
 wait_for_monitor() { # name seconds
@@ -415,17 +419,21 @@ wait_for_monitor() { # name seconds
 # Forces a port on and waits for the compositor to show it. Prints the output
 # name. Tries up to three candidates when the port is "auto".
 port_on() {
-  local c out tries=0
+  local c out tries=0 timed_out=() err cands=()
   helper_installed || { add_error "The port helper is not installed. Open the panel and choose Install helper."; return 1; }
   build_edid || return 1
-  for c in $(port_candidates); do
+  # Read the list up front: commands in the loop (pkexec, the compositor's
+  # CLI) must not inherit, and possibly consume, the candidates as stdin.
+  mapfile -t cands < <(port_candidates)
+  for c in "${cands[@]}"; do
+    [[ -n $c ]] || continue
     ((tries++ < 3)) || break
     out=${c#*-}
     log "port: trying $c"
-    local err
     if ! err=$(pkexec "$HELPER" on "$c" <"$EDID" 2>&1 >>"$LOG"); then
       log "port: $err"
-      add_error "${err#port-helper: }"
+      local msg=${err#port-helper: }
+      add_error "${msg:-Could not enable $c (port helper failed)}"
       continue
     fi
     if wait_for_monitor "$out" 6; then
@@ -435,9 +443,16 @@ port_on() {
       return 0
     fi
     log "port: $c did not appear in the compositor"
+    timed_out+=("$c")
     pkexec "$HELPER" off "$c" >>"$LOG" 2>&1
   done
-  ((tries)) || add_error "No free display port found (all are in use)"
+  if ((tries == 0)); then
+    add_error "No free display port found (all are in use)"
+  elif ((${#timed_out[@]})); then
+    local list
+    list=$(printf '%s, ' "${timed_out[@]}")
+    add_error "Forced display port (${list%, }) did not appear in ${COMP:-the compositor} (see $LOG)"
+  fi
   return 1
 }
 
@@ -447,7 +462,49 @@ port_off() { # card-connector
   if ! err=$(pkexec "$HELPER" off "$1" 2>&1 >>"$LOG"); then
     log "port: $err"
     add_error "Could not release $1: ${err#port-helper: }"
+    return 1
   fi
+}
+
+# Connectors carrying our EDID (manufacturer "VDP", bytes 8-9 = 0x5890) that
+# this session doesn't own. They were forced on by a session that ended
+# without turning off, usually a logout: that wipes $XDG_RUNTIME_DIR and
+# session.json with it, but not the helper's state under /run, so the port
+# stays connected and the compositor keeps it as a monitor (with workspaces).
+orphan_ports() {
+  local own c base
+  own=$(session | jq -r '.port // empty')
+  for c in /sys/class/drm/card*-*; do
+    base=${c##*/}
+    [[ $base =~ ^card[0-9]+-(DP|HDMI-A|HDMI-B|DVI-D|DVI-I)-[0-9]+$ ]] || continue
+    [[ $base == "$own" ]] && continue
+    [[ $(cat "$c/status" 2>/dev/null) == connected ]] || continue
+    [[ $(od -An -tx1 -j8 -N2 "$c/edid" 2>/dev/null | tr -d ' \n') == 5890 ]] && echo "$base"
+  done
+}
+
+# Turns orphans off. The helper refuses any connector it didn't force, so a
+# real monitor is never touched. Returns 0 if it released something.
+# Reconcile runs on every state poll, so a port that failed to release is
+# remembered and skipped there (no pkexec and no repeated error every few
+# seconds); Extend and Off pass --retry to try it again.
+release_orphans() { # [--retry]
+  local c released=1 failed
+  helper_installed || return 1
+  failed=$(session | jq -c '.orphanFailed // []')
+  for c in $(orphan_ports); do
+    if [[ ${1:-} != --retry ]] && jq -e --arg c "$c" 'index($c)' <<<"$failed" >/dev/null; then
+      continue
+    fi
+    log "port: releasing $c, left on by an earlier session"
+    if port_off "$c"; then
+      released=0
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c])' --arg c "$c"
+    else
+      update_session '.orphanFailed = ((.orphanFailed // []) - [$c] + [$c])' --arg c "$c"
+    fi
+  done
+  return $released
 }
 
 # ---------------------------------------------------------------- virtual method
@@ -492,10 +549,14 @@ auto_scale() { # w h diag
     s = int(s * 4 + 0.5) / 4; if (s < 1) s = 1; if (s > 3) s = 3; print s }'
 }
 
+valid_scale() {
+  [[ $1 =~ ^[0-9](\.[0-9]{1,3})?$ ]] && awk -v s="$1" 'BEGIN { exit !(s >= 0.5 && s <= 5) }'
+}
+
 current_scale() {
   local s p
   s=$(setting scale)
-  if [[ $s =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$s"; return; fi
+  if valid_scale "$s"; then echo "$s"; return; fi
   p=$(profile)
   auto_scale "$(jq -r .w <<<"$p")" "$(jq -r .h <<<"$p")" "$(jq -r .diag <<<"$p")"
 }
@@ -726,7 +787,10 @@ unmap_input_devices() {
   if [[ $COMP == hyprland ]]; then
     while IFS= read -r entry; do
       name="${entry%%=*}"
-      [[ -n $name ]] && hyprctl eval "hl.device({ name = \"$name\", output = \"\" })" >/dev/null 2>&1
+      [[ -n $name && $name =~ ^[A-Za-z0-9._:()-]+$ ]] || continue
+      if [[ $(hyprctl eval "hl.device({ name = \"$name\", output = \"\" })" 2>&1) != ok* ]]; then
+        hyprctl keyword "device[$name]:output" "" >/dev/null 2>&1 || true
+      fi
     done < <(session | jq -r '.mapped[]?')
   fi
   update_session '.mapped = []'
@@ -761,11 +825,16 @@ stop_sunshine() {
 }
 
 # Sunshine's HTTP port (Moonlight's first contact). `port` in sunshine.conf
-# moves the whole range; 47989 is the default (RTSP is port + 21 = 48010).
+# moves the whole range; 47989 is the default (Web UI is port + 1 = 47990,
+# RTSP is port + 21 = 48010).
 sunshine_port() {
   local p
-  p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
-  echo "${p:-47989}"
+  p=$(sed -nE 's/^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]{1,5})[[:space:]]*$/\1/p' "$SUNSHINE_CONF" 2>/dev/null | tail -1)
+  if [[ -n $p ]] && ((10#$p >= 6 && 10#$p <= 65514)); then
+    echo "$((10#$p))"
+  else
+    echo 47989
+  fi
 }
 
 # Heuristic check: verify Sunshine's TCP HTTP (port) and RTSP (port + 21)
@@ -1197,6 +1266,7 @@ teardown() { # [notice] [--no-restart]
   update_session '. + {mode: "off", method: "", output: "", port: "", target: "", listenRetried: false, client: null, applied: "", busy: "", notice: $n}' \
     --arg n "$notice"
   log "off"
+  release_orphans --retry && { sleep 0.3; rebase_layout; }
 }
 
 do_start() { # mode [target]
@@ -1222,6 +1292,7 @@ do_start() { # mode [target]
     return 1
   fi
 
+  release_orphans --retry && sleep 0.3
   if [[ $mode == extend ]]; then
     # Where the real monitors are before the tablet appears; placement pins
     # them here (see apply_display).
@@ -1339,6 +1410,7 @@ reconcile() {
         log "reconcile: failed to restore $SUNSHINE_CONF"
       fi
     fi
+    release_orphans && { sleep 0.3; rebase_layout; }
     return 0
   fi
 
@@ -1352,6 +1424,28 @@ reconcile() {
     return 0
   fi
 
+  local pid age p
+  pid=$(sunshine_pid)
+  if [[ -z $pid ]]; then
+    if sunshine_has_unit && [[ $(systemctl --user is-active "$SUNSHINE_UNIT" 2>/dev/null) =~ ^(activating|reloading)$ ]]; then
+      [[ $(jq -r '.client != null' <<<"$s") == true ]] && update_session '.client = null'
+      return 0
+    fi
+    log "reconcile: sunshine stopped"
+    teardown "Sunshine stopped, so the tablet display was turned off." --no-restart
+    return 0
+  fi
+
+  age=$(sunshine_age "$pid")
+  if [[ $(jq -r '.client != null' <<<"$s") == true && $age =~ ^[0-9]+$ ]]; then
+    local since
+    since=$(jq -r 'if (.client | type == "object") and (.client.since | type == "number") then (.client.since | floor) else 0 end' <<<"$s")
+    if ((since > 0 && since + 2 < $(date +%s) - age)); then
+      log "reconcile: clearing stale client (sunshine restarted)"
+      update_session '.client = null'
+    fi
+  fi
+
   if [[ $mode == extend ]]; then
     local now applied
     now=$(monitor_signature "$out"); applied=$(jq -r .applied <<<"$s")
@@ -1363,11 +1457,8 @@ reconcile() {
   # Sunshine can be running yet not accepting connections (a port was still
   # in use when it started). Give a fresh start time to bind, then schedule
   # one detached restart per session so `state` stays fast and never loops.
-  local pid age p
-  pid=$(sunshine_pid)
-  age=$(sunshine_age "$pid")
   p=$(sunshine_port)
-  if [[ -n $pid && -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
+  if [[ -n $age ]] && ((age > 20)) && [[ $(jq -r '.listenRetried == true' <<<"$s") != true ]] && ! sunshine_listening "$p" "$pid"; then
     log "reconcile: sunshine (pid $pid) up ${age}s but not listening on $p/$((p + 21)); scheduling restart"
     update_session '.listenRetried = true'
     setsid -f bash "$CTL" repair-sunshine active >>"$LOG" 2>&1 </dev/null 9>&-
@@ -1400,8 +1491,9 @@ cmd_repair_sunshine() { # stale|active
 }
 
 print_state() {
-  local s st mons method="" helper_needed=false
-  s=$(session); st=$(settings)
+  local s st mons prof auto_sc method="" helper_needed=false
+  s=$(session); st=$(settings); prof=$(profile)
+  auto_sc=$(auto_scale "$(jq -r .w <<<"$prof")" "$(jq -r .h <<<"$prof")" "$(jq -r .diag <<<"$prof")")
   [[ -n $COMP ]] || COMP=$(detect_compositor)
   mons=$(monitors_json)
   method=$(jq -r '.method // empty' <<<"$s")
@@ -1409,13 +1501,13 @@ print_state() {
   [[ $method == port ]] && helper_needed=true
 
   jq -cn \
-    --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson prof "$(profile)" \
+    --argjson s "$s" --argjson st "$st" --argjson mons "$mons" --argjson prof "$prof" \
     --argjson installed "$(sunshine_installed && echo true || echo false)" \
     --argjson running "$(sunshine_running && echo true || echo false)" \
     --argjson hInst "$(helper_installed && echo true || echo false)" \
     --argjson hCur "$(helper_current && echo true || echo false)" \
     --argjson hNeed "$helper_needed" \
-    --arg comp "$COMP" --arg method "$method" --arg scale "$(current_scale)" \
+    --arg comp "$COMP" --arg method "$method" --arg scale "$(current_scale)" --arg autoScale "$auto_sc" \
     --argjson usb "$(usb_links)" \
     --argjson fw "$( (command -v ufw || command -v firewall-cmd) >/dev/null 2>&1 && echo true || echo false)" \
     --arg host "$(cat /etc/hostname 2>/dev/null || hostname)" \
@@ -1425,7 +1517,7 @@ print_state() {
       mode: $s.mode, busy: $s.busy, method: $method, compositor: $comp,
       output: $s.output, port: $s.port, target: $s.target,
       client: $s.client, errors: $s.errors, notice: $s.notice,
-      position: $st.position, scaleSetting: $st.scale, scale: $scale, audio: $st.audio,
+      position: $st.position, scaleSetting: $st.scale, scale: $scale, autoScale: $autoScale, audio: $st.audio,
       profile: $prof,
       helper: {needed: $hNeed, installed: $hInst, current: $hCur},
       monitor: ($mons | map(select(.name == $s.target)) | .[0]
@@ -1436,12 +1528,14 @@ print_state() {
       addresses: ($addrs | split(" ") | map(select(. != "")) | map(select(. as $a | $usb | map(.ip) | index($a) | not)))
     }
     | .hint = (
-        if .client and .monitor then
+        if (.client | type == "object") and (.monitor | type == "object")
+           and (.client.width | type == "number" and . > 0) and (.client.height | type == "number" and . > 0)
+           and (.monitor.width | type == "number" and . > 0) and (.monitor.height | type == "number" and . > 0) then
           (.client.width / .client.height) as $cr | (.monitor.width / .monitor.height) as $mr
           | "\(.client.width)×\(.client.height)" as $c | "\(.monitor.width)×\(.monitor.height)" as $m
           | if (($cr - $mr) | fabs) / $mr > 0.02 then
               "Moonlight is streaming \($c), a different shape from this \($m) display, so you will see black bars. Set Moonlight to Native resolution and reconnect."
-            elif .client.width < 1600 then
+            elif .client.width < 1600 and .client.width < .monitor.width then
               "Moonlight is streaming only \($c), so it will look soft. Set Moonlight to Native resolution and reconnect."
             else "" end
         else "" end)'
@@ -1462,7 +1556,7 @@ cmd_set() { # key value
   local key=$1 value=$2 s mode
   case $key in
     position) [[ $value =~ ^(left|right|above|below)$ ]] || return 64 ;;
-    scale) [[ $value == auto || $value =~ ^[0-9](\.[0-9]{1,3})?$ ]] || return 64 ;;
+    scale) [[ $value == auto ]] || valid_scale "$value" || return 64 ;;
     *) echo "unknown setting: $key" >&2; return 64 ;;
   esac
   update_settings '.[$k] = $v' --arg k "$key" --arg v "$value"
@@ -1504,7 +1598,8 @@ cmd_configure() { # json
 }
 
 open_admin() { # [path]
-  user_locale setsid -f xdg-open "https://localhost:47990${1:-}" >/dev/null 2>&1
+  local port=$(($(sunshine_port) + 1))
+  user_locale setsid -f xdg-open "https://localhost:${port}${1:-}" >/dev/null 2>&1 </dev/null
 }
 
 cmd_doctor() {
@@ -1525,14 +1620,18 @@ cmd_doctor() {
   echo "free ports:       $(free_ports | paste -sd' ')"
   echo "profile:          $(profile)"
   echo "edid:             $([[ -f $EDID ]] && cat "$EDID_ARGS" || echo 'not built yet')"
-  if command -v ufw >/dev/null; then echo "firewall:         ufw is installed; Sunshine needs TCP 47984,47989,47990,48010 and UDP 47998-48000 open"; fi
+  local p tcp_ports udp_ports
+  p=$(sunshine_port)
+  tcp_ports="$((p - 5)),$p,$((p + 1)),$((p + 21))"
+  udp_ports="$((p + 9)):$((p + 11))"
+  if command -v ufw >/dev/null; then echo "firewall:         ufw is installed; Sunshine needs TCP $tcp_ports and UDP ${udp_ports/:/-} open"; fi
   local links
   links=$(usb_links)
   if [[ $(jq length <<<"$links") -gt 0 ]]; then
     jq -r '.[] | "usb link:         \(.iface) (\(.driver), \(.speed) Mbit/s) at \(.ip)\(if .defaultRoute then ", carrying the default route" else "" end)"' <<<"$links"
     if command -v ufw >/dev/null; then
       echo "                  If Moonlight can't connect over USB, allow Sunshine on the link:"
-      jq -r '.[] | "                    sudo ufw allow in on \(.iface) proto tcp to any port 47984,47989,47990,48010\n                    sudo ufw allow in on \(.iface) proto udp to any port 47998:48000"' <<<"$links"
+      jq -r --arg tcp "$tcp_ports" --arg udp "$udp_ports" '.[] | "                    sudo ufw allow in on \(.iface) proto tcp to any port \($tcp)\n                    sudo ufw allow in on \(.iface) proto udp to any port \($udp)"' <<<"$links"
     fi
   else
     echo "usb link:         none (turn on USB tethering on the tablet to stream over the cable)"
@@ -1578,7 +1677,9 @@ case "${1:-}" in
   mirror) with_lock do_start mirror "${2:-}" ;;
   off) ensure_env; with_lock teardown ;;
   set) [[ $# -eq 3 ]] || usage; with_lock cmd_set "$2" "$3" ;;
-  configure) [[ $# -eq 2 ]] || usage; ensure_env; with_lock cmd_configure "$2" ;;
+  # A short lock wait, so a held lock reports "busy" (75) well inside
+  # service.luau's configure timeout instead of timing out.
+  configure) [[ $# -eq 2 ]] || usage; ensure_env; LOCK_WAIT=10 with_lock cmd_configure "$2" ;;
   hook-start) LOCK_WAIT=5 with_lock hook_start; exit 0 ;;
   hook-stop) LOCK_WAIT=5 with_lock hook_stop; exit 0 ;;
   repair-sunshine) ensure_env; LOCK_WAIT=5 with_lock cmd_repair_sunshine "${2:-}" ;;
