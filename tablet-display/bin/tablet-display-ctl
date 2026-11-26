@@ -1250,8 +1250,12 @@ do_start() { # mode [target]
   update_session '. + {mode: $m, target: $t, sunshineWasRunning: $w}' \
     --arg m "$mode" --arg t "$target" --argjson w "$was"
 
+  # Errors from earlier steps (e.g. a port candidate port_on skipped) may
+  # already be listed; only skip the generic error if apply_conf added its own.
+  local errs_before
+  errs_before=$(session | jq -c '.errors')
   if ! apply_conf "$target"; then
-    [[ $(session | jq '.errors | length') -eq 0 ]] && add_error "Could not write $SUNSHINE_CONF"
+    [[ $(session | jq -c '.errors') == "$errs_before" ]] && add_error "Could not write $SUNSHINE_CONF"
     restore_conf || true
     if [[ $mode == extend ]]; then
       remove_display "$(session)"
