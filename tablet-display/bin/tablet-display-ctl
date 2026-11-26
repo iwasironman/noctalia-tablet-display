@@ -450,6 +450,17 @@ desired_mode() { # output method
     if (.client | type == "object") and (.client.width | type == "number" and . > 0) and (.client.height | type == "number" and . > 0) then
       "\(.client.width | floor) \(.client.height | floor) \(if (.client.fps | type == "number" and . > 0) then (.client.fps | floor) else 0 end)"
     else "0 0 0" end' <<<"$s")
+  # A client recorded before the running Sunshine started (or with Sunshine
+  # gone) is stale: no stream outlives it, and a crash or a systemd restart
+  # never runs the hook-stop undo command.
+  if ((cw > 0)); then
+    local age since
+    age=$(sunshine_age)
+    since=$(jq -r '.client.since // 0 | floor' <<<"$s" 2>/dev/null)
+    if [[ ! $age =~ ^[0-9]+$ ]] || { [[ $since =~ ^[0-9]+$ ]] && ((since > 0 && since + 2 < $(date +%s) - age)); }; then
+      cw=0; ch=0; cfps=0
+    fi
+  fi
   if ((cw > 0 && ch > 0)); then
     w=$cw; h=$ch
   else
@@ -676,6 +687,9 @@ sunshine_has_unit() {
 stop_sunshine() {
   if sunshine_has_unit; then systemctl --user stop "$SUNSHINE_UNIT" 2>/dev/null; fi
   pkill -u "$(id -u)" -x sunshine 2>/dev/null
+  # Any stream ends with Sunshine, and a killed Sunshine may never run the
+  # hook-stop undo command; desired_mode must not keep using that client.
+  [[ -f $SESSION ]] && update_session '.client = null'
   for _ in {1..30}; do sunshine_running || return 0; sleep 0.1; done
   pkill -9 -u "$(id -u)" -x sunshine 2>/dev/null
 }
