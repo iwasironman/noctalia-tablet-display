@@ -1568,7 +1568,9 @@ case "${1:-}" in
   mirror) with_lock do_start mirror "${2:-}" ;;
   off) ensure_env; with_lock teardown ;;
   set) [[ $# -eq 3 ]] || usage; with_lock cmd_set "$2" "$3" ;;
-  configure) [[ $# -eq 2 ]] || usage; ensure_env; with_lock cmd_configure "$2" ;;
+  # A short lock wait, so a held lock reports "busy" (75) well inside
+  # service.luau's configure timeout instead of timing out.
+  configure) [[ $# -eq 2 ]] || usage; ensure_env; LOCK_WAIT=10 with_lock cmd_configure "$2" ;;
   hook-start) LOCK_WAIT=5 with_lock hook_start; exit 0 ;;
   hook-stop) LOCK_WAIT=5 with_lock hook_stop; exit 0 ;;
   repair-sunshine) ensure_env; LOCK_WAIT=5 with_lock cmd_repair_sunshine "${2:-}" ;;
